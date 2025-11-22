@@ -16,48 +16,34 @@ def send_telegram_message(text: str):
     resp.raise_for_status()
 
 
-# ========== CME 成交量 / 持仓量（带重试） ==========
+    # ==== CME ====
+    lines.append("【CME 期货结构】")
 
-def fetch_cme_oi():
-    """
-    抓取 CME 黄金期货（GC）持仓量 OI / 成交量 Vol
-    增加重试机制：最多尝试 3 次，每次超时 20 秒
-    返回 dict
-    """
-    url = "https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/416/G"
+    # 如果抓取失败，优雅降级，不展示长报错
+    if cme["volume"] == "Error" or cme["oi"] == "Error":
+        lines.append("• 成交量 Vol: 暂无（CME 接口未响应）")
+        lines.append("• 持仓量 OI: 暂无")
+        lines.append("• OI变化: 暂无")
+        lines.append("• 评价: 今日暂时无法连接 CME，忽略此维度，不影响其它信号（LBMA / MaxPain / TV）。")
+        lines.append("")
+    else:
+        lines.append(f"• 成交量 Vol: {cme['volume']}")
+        lines.append(f"• 持仓量 OI: {cme['oi']}")
+        lines.append(f"• OI变化: {cme['change_oi']}")
 
-    last_error = None
-
-    for attempt in range(3):
         try:
-            r = requests.get(url, timeout=20)
-            r.raise_for_status()
-            data = r.json()
+            change_oi_num = int(cme["change_oi"])
+            if change_oi_num > 0:
+                trend_eval = "增仓 → 趋势真实（若上涨=真涨、若下跌=真跌）"
+            elif change_oi_num < 0:
+                trend_eval = "减仓 → 趋势偏假（上涨易回落 / 下跌易反弹）"
+            else:
+                trend_eval = "持仓无明显变化 → 方向可能反复"
+        except Exception:
+            trend_eval = "数据解析异常"
 
-            quote = data["quotes"]["quote"][0]
-
-            volume = quote.get("volume", "N/A")
-            open_interest = quote.get("openInterest", "N/A")
-            change_oi = quote.get("changeOpenInterest", "N/A")
-
-            return {
-                "volume": volume,
-                "oi": open_interest,
-                "change_oi": change_oi
-            }
-
-        except Exception as e:
-            last_error = e
-            # 前两次失败，稍微等一会儿再重试
-            if attempt < 2:
-                time.sleep(3)
-
-    # 三次都失败，返回 Error 信息
-    return {
-        "volume": "Error",
-        "oi": "Error",
-        "change_oi": f"{type(last_error).__name__}: {last_error}"
-    }
+        lines.append(f"• 评价: {trend_eval}")
+        lines.append("")
 
 
 # ========== MaxPain / Skew 占位（后续接真实数据） ==========
