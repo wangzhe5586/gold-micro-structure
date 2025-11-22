@@ -1,8 +1,8 @@
 import requests
-from datetime import datetime, timedelta, timezone
 import time
+from datetime import datetime, timedelta, timezone
 
-# ====== 基本配置（你已经给我的） ======
+# ====== 基本配置 ======
 BOT_TOKEN = "8053639726:AAE_Kjpin_UGi6rrHDeDRvT9WrYVKUtR3UY"
 CHAT_ID = "6193487818"
 
@@ -16,7 +16,7 @@ def send_telegram_message(text: str):
     resp.raise_for_status()
 
 
-# ========== CME / CFTC 持仓量抓取模块（真实可用） ==========
+# ========== CME 成交量 / 持仓量（带重试） ==========
 
 def fetch_cme_oi():
     """
@@ -59,13 +59,6 @@ def fetch_cme_oi():
         "change_oi": f"{type(last_error).__name__}: {last_error}"
     }
 
-    except Exception as e:
-        return {
-            "volume": "Error",
-            "oi": "Error",
-            "change_oi": str(e)
-        }
-
 
 # ========== MaxPain / Skew 占位（后续接真实数据） ==========
 
@@ -82,19 +75,30 @@ def get_maxpain_skew_summary():
 # ========== LBMA 定盘价（真实数据） ==========
 
 def _fetch_latest_lbma_fix(url: str):
+    """
+    从 LBMA 官方 JSON 接口获取最新一条（USD 不为 0 的）定盘价记录
+    """
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     data = resp.json()
 
     valid_rows = [row for row in data if row.get("v") and row["v"][0]]
     if not valid_rows:
-        raise ValueError("LBMA 数据为空或无有效价格")
+        raise ValueError("LBMA 数据为空或没有有效价格")
 
     latest = max(valid_rows, key=lambda x: x["d"])
-    return latest["d"], float(latest["v"][0])
+    date_str = latest["d"]
+    usd_price = float(latest["v"][0])
+    return date_str, usd_price
 
 
 def get_lbma_fixing_summary():
+    """
+    真实版 LBMA AM/PM 定盘价：
+    - 从官方 JSON 拿最新一日 AM / PM
+    - 计算 PM - AM 差值
+    - 给出方向文字结论
+    """
     try:
         am_date, am_usd = _fetch_latest_lbma_fix("https://prices.lbma.org.uk/json/gold_am.json")
         pm_date, pm_usd = _fetch_latest_lbma_fix("https://prices.lbma.org.uk/json/gold_pm.json")
@@ -102,23 +106,26 @@ def get_lbma_fixing_summary():
         return {
             "am_fix": f"获取失败（{e}）",
             "pm_fix": f"获取失败（{e}）",
-            "bias_comment": "LBMA 定盘价获取失败，无法判断方向。"
+            "bias_comment": "LBMA 定盘价获取失败，暂时无法根据 Fixing 判断多空基准。"
         }
 
     diff = pm_usd - am_usd
-    threshold = 2.0
+    threshold = 2.0  # 美元差值阈值
 
     if diff > threshold:
         comment = (
-            f"PM({pm_usd:.2f}) > AM({am_usd:.2f})，差值 {diff:.2f} 美元：多头主导。"
+            f"PM({pm_usd:.2f}) > AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
+            "整体偏多头主导，回踩支撑后偏多看待。"
         )
     elif diff < -threshold:
         comment = (
-            f"PM({pm_usd:.2f}) < AM({am_usd:.2f})，差值 {diff:.2f} 美元：空头主导。"
+            f"PM({pm_usd:.2f}) < AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
+            "整体偏空头主导，反弹到压力/OB 附近偏空处理。"
         )
     else:
         comment = (
-            f"PM({pm_usd:.2f}) ≈ AM({am_usd:.2f})，差值 {diff:.2f} 美元：多空均衡。"
+            f"PM({pm_usd:.2f}) ≈ AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
+            "多空力量均衡，日内更容易震荡或区间博弈。"
         )
 
     return {
@@ -134,7 +141,6 @@ def build_micro_report():
     now = datetime.now(CN_TZ)
     date_str = now.strftime("%Y-%m-%d %H:%M")
 
-    # 抓取三大模块
     cme = fetch_cme_oi()
     mp = get_maxpain_skew_summary()
     lbma = get_lbma_fixing_summary()
@@ -150,16 +156,15 @@ def build_micro_report():
     lines.append(f"• 持仓量 OI: {cme['oi']}")
     lines.append(f"• OI变化: {cme['change_oi']}")
 
-    # 趋势真假逻辑
     try:
-        change_oi_num = int(cme['change_oi'])
+        change_oi_num = int(cme["change_oi"])
         if change_oi_num > 0:
-            trend_eval = "增仓 → 趋势真实"
+            trend_eval = "增仓 → 趋势真实（若上涨=真涨、若下跌=真跌）"
         elif change_oi_num < 0:
-            trend_eval = "减仓 → 趋势偏假"
+            trend_eval = "减仓 → 趋势偏假（上涨易回落 / 下跌易反弹）"
         else:
-            trend_eval = "持仓无明显变化 → 波动反复"
-    except:
+            trend_eval = "持仓无明显变化 → 方向可能反复"
+    except Exception:
         trend_eval = "数据暂不可用"
 
     lines.append(f"• 评价: {trend_eval}")
@@ -181,9 +186,10 @@ def build_micro_report():
     lines.append(f"• 评估: {lbma['bias_comment']}")
     lines.append("")
 
-    # ==== 综合结论（可后续升级 AI 自动生成） ====
-    lines.append("【综合结论（示例逻辑）】")
-    lines.append("• 示例: 若 CME 增仓 + PM>AM → 顺势偏多；若减仓 + Skew 偏空 → 反弹做空。")
+    # ==== 综合结论（后续可以再智能化） ====
+    lines.append("【综合结论（示例逻辑，后续可细化）】")
+    lines.append("• 示例: 若 CME 增仓 + PM>AM → 顺势偏多；若减仓 + Skew 偏空 → 反弹做空；")
+    lines.append("→ 美盘若放量下破 CPR，下行趋势概率高。")
 
     return "\n".join(lines)
 
