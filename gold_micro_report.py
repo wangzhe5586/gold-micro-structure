@@ -114,7 +114,8 @@ def build_micro_report():
     now = datetime.now(CN_TZ)
     date_str = now.strftime("%Y-%m-%d %H:%M")
 
-    cme = get_cme_summary()
+    # 抓取三大模块
+    cme = fetch_cme_oi()
     mp = get_maxpain_skew_summary()
     lbma = get_lbma_fixing_summary()
 
@@ -122,15 +123,29 @@ def build_micro_report():
     lines.append("📊 黄金微观结构报告")
     lines.append(f"时间（北京）：{date_str}")
     lines.append("")
-    # ===== CME 部分 =====
+
+    # ==== CME ====
     lines.append("【CME 期货结构】")
-    lines.append(f"• 品种: {cme['symbol']}")
-    lines.append(f"• 成交量: {cme['volume']}")
-    lines.append(f"• 持仓量(OI): {cme['oi']}")
-    lines.append(f"• OI 变化: {cme['change_oi']}")
-    lines.append(f"• 评估: {cme['comment']}")
+    lines.append(f"• 成交量 Vol: {cme['volume']}")
+    lines.append(f"• 持仓量 OI: {cme['oi']}")
+    lines.append(f"• OI变化: {cme['change_oi']}")
+
+    # 趋势真假逻辑
+    try:
+        change_oi_num = int(cme['change_oi'])
+        if change_oi_num > 0:
+            trend_eval = "增仓 → 趋势真实"
+        elif change_oi_num < 0:
+            trend_eval = "减仓 → 趋势偏假"
+        else:
+            trend_eval = "持仓无明显变化 → 波动反复"
+    except:
+        trend_eval = "数据暂不可用"
+
+    lines.append(f"• 评价: {trend_eval}")
     lines.append("")
-    # ===== MaxPain / Skew 占位部分（后面再接真实数据）=====
+
+    # ==== MaxPain ====
     lines.append("【期权 MaxPain / Skew】")
     lines.append(f"• 标的: {mp['underlying']}")
     lines.append(f"• 到期日: {mp['expiry']}")
@@ -138,20 +153,19 @@ def build_micro_report():
     lines.append(f"• 反转带: {mp['reversion_zone']}")
     lines.append(f"• 评估: {mp['skew_comment']}")
     lines.append("")
-    # ===== LBMA 部分 =====
+
+    # ==== LBMA ====
     lines.append("【LBMA 定盘价】")
     lines.append(f"• AM Fix: {lbma['am_fix']}")
     lines.append(f"• PM Fix: {lbma['pm_fix']}")
     lines.append(f"• 评估: {lbma['bias_comment']}")
     lines.append("")
-    # ===== 综合结论（暂时仍是示例文案）=====
-    lines.append("【综合结论（示例逻辑，后续可细化）】")
-    lines.append("• 示例: CME 增仓下跌 + Skew 偏空 + PM>AM：")
-    lines.append("  → 日内偏空主导，反弹到关键阻力/OB 附近优先做空；")
-    lines.append("  → 美盘若放量下破 CPR，下行趋势概率高。")
+
+    # ==== 综合结论（可后续升级 AI 自动生成） ====
+    lines.append("【综合结论（示例逻辑）】")
+    lines.append("• 示例: 若 CME 增仓 + PM>AM → 顺势偏多；若减仓 + Skew 偏空 → 反弹做空。")
 
     return "\n".join(lines)
-
 
 
 if __name__ == "__main__":
