@@ -72,6 +72,30 @@ def fetch_cme_oi():
 # ========== 期权 MaxPain / Skew 模块（目前为结构占位，后面可接真实 GLD 期权数据） ==========
 
 def get_maxpain_skew_summary():
+    # ========= GLD → 黄金 XAUUSD 自动换算工具 =========
+
+def gld_to_xau(gld_price):
+    """
+    将 GLD 价格转换为黄金美元价格：
+    黄金价格 ≈ GLD / 0.093
+    """
+    return gld_price / 0.093
+
+
+def convert_gld_zone_to_xau(zone_str):
+    """
+    将 '374.0 - 376.0' 形式的反转带转换为黄金价格区间
+    """
+    try:
+        lower, upper = zone_str.split("-")
+        lower = float(lower.strip())
+        upper = float(upper.strip())
+        xau_lower = gld_to_xau(lower)
+        xau_upper = gld_to_xau(upper)
+        return f"{xau_lower:.0f} - {xau_upper:.0f}"
+    except:
+        return "转换失败"
+
     """
     使用 yfinance 获取 GLD 期权链，计算：
     - 最近到期合约的 MaxPain 行权价
@@ -315,8 +339,8 @@ def build_micro_report():
     lines.append("【期权 MaxPain / Skew】")
     lines.append(f"• 标的: {mp['underlying']}")
     lines.append(f"• 到期日: {mp['expiry']}")
-    lines.append(f"• MaxPain: {mp['max_pain']}")
-    lines.append(f"• 反转带: {mp['reversion_zone']}")
+    lines.append(f"• MaxPain(GLD): {mp['max_pain']}  ≈ XAU {gld_to_xau(float(mp['max_pain'])):.0f} 美元")
+    lines.append(f"• 反转带(GLD): {mp['reversion_zone']}  ≈ XAU {convert_gld_zone_to_xau(mp['reversion_zone'])} 美元")
     lines.append(f"• 评估: {mp['skew_comment']}")
     lines.append("")
 
@@ -326,11 +350,56 @@ def build_micro_report():
     lines.append(f"• PM Fix: {lbma['pm_fix']}")
     lines.append(f"• 评估: {lbma['bias_comment']}")
     lines.append("")
+def build_auto_conclusion(cme, mp, lbma):
+    """
+    根据 CME 成交量 / OI、期权 Skew、MaxPain 偏离、LBMA 定盘价结构
+    自动生成综合多空倾向（专业交易员版）
+    """
+
+    conclusion = []
+
+    # --- 1）CME层 ---
+    if cme["oi"] == "暂无" or cme["volume"] == "暂无":
+        conclusion.append("• CME 数据缺失 → 使用其他因素优先判断。")
+    else:
+        if cme["change_oi"] > 0 and cme["volume"] > 0:
+            conclusion.append("• CME：增仓上涨 → 多头力量偏强。")
+        elif cme["change_oi"] < 0:
+            conclusion.append("• CME：减仓下跌 → 空头主导，趋势延续概率大。")
+        else:
+            conclusion.append("• CME：持仓结构中性。")
+
+    # --- 2）Skew层 ---
+    skew = mp["skew_comment"]
+    if "偏多" in skew:
+        conclusion.append("• Skew：仓位偏多 → 下方支撑较强。")
+    elif "偏空" in skew:
+        conclusion.append("• Skew：仓位偏空 → 上方压力明显。")
+    else:
+        conclusion.append("• Skew：多空结构中性。")
+
+    # --- 3）MaxPain 偏离 ---
+    try:
+        maxpain = float(mp["max_pain"])
+        xau_mp = gld_to_xau(maxpain)
+        lbma_avg = (lbma["am"] + lbma["pm"]) / 2
+
+        diff = (lbma_avg - xau_mp)
+
+        if diff > 8:
+            conclusion.append("• MaxPain：黄金高于 MaxPain 多 → 回调概率更高。")
+        elif diff < -8:
+            conclusion.append("• MaxPain：黄金低于 MaxPain → 易反弹补价差。")
+        else:
+            conclusion.append("• MaxPain：价格围绕中枢 → 更倾向震荡行情。")
+    except:
+        conclusion.append("• MaxPain：数据暂不可用。")
+
+    return "\n".join(conclusion)
 
     # ==== 综合结论（后续可以再智能化） ====
-    lines.append("【综合结论（示例逻辑，后续可细化）】")
-    lines.append("• 示例: 若 CME 增仓 + PM>AM → 顺势偏多；若减仓 + Skew 偏空 → 反弹做空；")
-    lines.append("→ 美盘若放量下破 CPR，下行趋势概率高。")
+    lines.append("【综合结论】")
+    lines.append(build_auto_conclusion(cme, mp, lbma))
 
     return "\n".join(lines)
 
