@@ -16,45 +16,71 @@ def send_telegram_message(text: str):
     resp.raise_for_status()
 
 
-    # ==== CME ====
-    lines.append("【CME 期货结构】")
+# ========== CME 成交量 / 持仓量（带重试 + 优雅降级） ==========
 
-    # 如果抓取失败，优雅降级，不展示长报错
-    if cme["volume"] == "Error" or cme["oi"] == "Error":
-        lines.append("• 成交量 Vol: 暂无（CME 接口未响应）")
-        lines.append("• 持仓量 OI: 暂无")
-        lines.append("• OI变化: 暂无")
-        lines.append("• 评价: 今日暂时无法连接 CME，忽略此维度，不影响其它信号（LBMA / MaxPain / TV）。")
-        lines.append("")
-    else:
-        lines.append(f"• 成交量 Vol: {cme['volume']}")
-        lines.append(f"• 持仓量 OI: {cme['oi']}")
-        lines.append(f"• OI变化: {cme['change_oi']}")
+def fetch_cme_oi():
+    """
+    抓取 CME 黄金期货（GC）持仓量 OI / 成交量 Vol
+    增加重试机制：最多尝试 3 次，每次超时 15 秒
+    返回 dict:
+        {
+            "volume": ...,
+            "oi": ...,
+            "change_oi": ...,
+            "ok": True/False
+        }
+    """
+    url = "https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/416/G"
 
+    last_error = None
+
+    for attempt in range(3):
         try:
-            change_oi_num = int(cme["change_oi"])
-            if change_oi_num > 0:
-                trend_eval = "增仓 → 趋势真实（若上涨=真涨、若下跌=真跌）"
-            elif change_oi_num < 0:
-                trend_eval = "减仓 → 趋势偏假（上涨易回落 / 下跌易反弹）"
-            else:
-                trend_eval = "持仓无明显变化 → 方向可能反复"
-        except Exception:
-            trend_eval = "数据解析异常"
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
 
-        lines.append(f"• 评价: {trend_eval}")
-        lines.append("")
+            quote = data["quotes"]["quote"][0]
+
+            volume = quote.get("volume", "N/A")
+            open_interest = quote.get("openInterest", "N/A")
+            change_oi = quote.get("changeOpenInterest", "0")
+
+            return {
+                "volume": volume,
+                "oi": open_interest,
+                "change_oi": change_oi,
+                "ok": True
+            }
+
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(3)
+
+    # 三次都失败，返回优雅降级结果
+    return {
+        "volume": "—",
+        "oi": "—",
+        "change_oi": "0",
+        "ok": False
+    }
 
 
-# ========== MaxPain / Skew 占位（后续接真实数据） ==========
+# ========== 期权 MaxPain / Skew 模块（目前为结构占位，后面可接真实 GLD 期权数据） ==========
 
 def get_maxpain_skew_summary():
+    """
+    目前先用占位数据，结构已经搭好，后面可以接 GLD 期权链真实计算：
+      - MaxPain = 使卖方总亏损最小的执行价
+      - Skew = 看多/看空倾斜度（用看涨/看跌隐含波动率差计算）
+    """
     return {
         "underlying": "GLD 期权",
-        "expiry": "示例: 最近周五",
-        "max_pain": "示例: 205",
-        "skew_comment": "示例: Skew 偏空 → 上方压力大，下破支撑后易加速",
-        "reversion_zone": "示例: 204.5 - 205.5"
+        "expiry": "示例：最近周五到期",
+        "max_pain": "示例：205",
+        "reversion_zone": "示例：204.5 - 205.5",
+        "skew_comment": "示例：Skew 偏空 → 上方压力大，下破支撑后易加速"
     }
 
 
@@ -138,25 +164,30 @@ def build_micro_report():
 
     # ==== CME ====
     lines.append("【CME 期货结构】")
-    lines.append(f"• 成交量 Vol: {cme['volume']}")
-    lines.append(f"• 持仓量 OI: {cme['oi']}")
-    lines.append(f"• OI变化: {cme['change_oi']}")
+    if not cme["ok"]:
+        lines.append("• 成交量 Vol: 暂无（CME 接口未响应）")
+        lines.append("• 持仓量 OI: 暂无")
+        lines.append("• OI变化: 暂无")
+        lines.append("• 评价: 今日暂无法连接 CME，忽略此维度，不影响 LBMA / 期权 / TV 信号。")
+        lines.append("")
+    else:
+        lines.append(f"• 成交量 Vol: {cme['volume']}")
+        lines.append(f"• 持仓量 OI: {cme['oi']}")
+        lines.append(f"• OI变化: {cme['change_oi']}")
+        try:
+            change_oi_num = int(cme["change_oi"])
+            if change_oi_num > 0:
+                trend_eval = "增仓 → 趋势真实（若上涨=真涨、若下跌=真跌）"
+            elif change_oi_num < 0:
+                trend_eval = "减仓 → 趋势偏假（上涨易回落 / 下跌易反弹）"
+            else:
+                trend_eval = "持仓无明显变化 → 方向可能反复"
+        except Exception:
+            trend_eval = "数据解析异常"
+        lines.append(f"• 评价: {trend_eval}")
+        lines.append("")
 
-    try:
-        change_oi_num = int(cme["change_oi"])
-        if change_oi_num > 0:
-            trend_eval = "增仓 → 趋势真实（若上涨=真涨、若下跌=真跌）"
-        elif change_oi_num < 0:
-            trend_eval = "减仓 → 趋势偏假（上涨易回落 / 下跌易反弹）"
-        else:
-            trend_eval = "持仓无明显变化 → 方向可能反复"
-    except Exception:
-        trend_eval = "数据暂不可用"
-
-    lines.append(f"• 评价: {trend_eval}")
-    lines.append("")
-
-    # ==== MaxPain ====
+    # ==== MaxPain / Skew ====
     lines.append("【期权 MaxPain / Skew】")
     lines.append(f"• 标的: {mp['underlying']}")
     lines.append(f"• 到期日: {mp['expiry']}")
