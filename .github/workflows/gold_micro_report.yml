@@ -22,7 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests
+          pip install requests yfinance pandas
 
       - name: Run gold micro report
         run: |
