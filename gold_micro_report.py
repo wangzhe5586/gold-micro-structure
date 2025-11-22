@@ -460,6 +460,89 @@ def calc_structure_score(cme, mp, vol, lbma):
     }
 
 
+# ========== 自动策略建议 ==========
+def build_auto_strategy_lines(cme, mp, vol, lbma, rating):
+    """
+    把结构信号翻译成更接近“今日交易计划”的语句
+    输出一段【自动策略建议】文本（仍然需要结合盘面执行）
+    """
+    lines = []
+
+    score = rating["score"]
+    stars = rating["stars"]
+    bias = rating["bias"]
+
+    # 1）今日整体结构 & 做单方向
+    lines.append("【自动策略建议】")
+    lines.append(f"• 今日结构: {bias}（{stars}）")
+
+    if bias in ("强多", "偏多"):
+        lines.append("• 做单方向: 日内以顺势多单为主，高位空单以短线为辅。")
+    elif bias == "偏空":
+        lines.append("• 做单方向: 日内以反弹做空为主，关键支撑附近轻仓多单博反弹。")
+    else:
+        lines.append("• 做单方向: 以区间震荡思路为主，在 OB / CPR / 反转带两端高抛低吸，避免追高杀跌。")
+
+    # 2）MaxPain / 反转带换算到 XAU 的参考区间
+    max_pain_xau = mp.get("max_pain_xau")
+    rev_zone_xau = mp.get("reversion_zone_xau")
+    spot_xau = mp.get("spot_xau")
+    dev_pct = mp.get("deviation_pct")
+    dev_comment = mp.get("deviation_comment")
+
+    if max_pain_xau is not None and rev_zone_xau is not None:
+        low_xau, high_xau = rev_zone_xau
+        lines.append(
+            f"• 结构中枢: MaxPain 约 {max_pain_xau:.0f}，反转带 {low_xau:.0f}-{high_xau:.0f}（XAU，仅做区间参考）。"
+        )
+        if spot_xau is not None:
+            lines.append(f"• 现价参考: GLD 换算 XAU 约 {spot_xau:.0f}，可结合盘面实时 XAUUSD 对比。")
+
+    if dev_pct is not None and dev_comment:
+        lines.append(f"• MaxPain 偏离: 约 {dev_pct:.2f}% → {dev_comment}")
+
+    # 3）波动环境提示
+    hv = vol.get("hv_20")
+    vol_level = vol.get("level")
+    vol_comment = vol.get("comment")
+    if hv is not None and vol_level and vol_comment:
+        lines.append(f"• 波动环境: {vol_level}（20 日 HV≈{hv:.1f}%） → {vol_comment}")
+
+    # 4）CME / CFTC 补充（真假趋势）
+    if not cme.get("ok"):
+        lines.append("• CME/CFTC: 当前使用 CFTC 周度持仓作背景，日内不宜单独依赖持仓博方向。")
+    else:
+        try:
+            change_oi = int(cme.get("change_oi", "0"))
+            if change_oi > 0:
+                lines.append("• CME: 持仓增仓 → 当前趋势更容易延续，不宜重仓逆势。")
+            elif change_oi < 0:
+                lines.append("• CME: 持仓减仓 → 假突破/反向拉扯风险上升，追价需要更谨慎。")
+            else:
+                lines.append("• CME: 持仓基本持平 → 更容易走震荡或区间行情。")
+        except Exception:
+            lines.append("• CME: OI 解析失败 → 暂时忽略持仓信号，以盘面结构为主。")
+
+    # 5）最后给一个执行层面的总提示
+    if bias in ("强多", "偏多"):
+        lines.append(
+            "• 执行提示: 优先在 4H/1H 多头 OB / CPR 下沿附近找多单；"
+            "若价格远高于 MaxPain/反转带上沿，谨慎追多，等待回踩或形态确认。"
+        )
+    elif bias == "偏空":
+        lines.append(
+            "• 执行提示: 优先在 4H/1H 空头 OB / CPR 上沿附近找空单；"
+            "下破反转带下沿后的回踩不站回，可考虑顺势跟空。"
+        )
+    else:
+        lines.append(
+            "• 执行提示: 震荡结构下，区间两端（OB / CPR / 反转带上下沿）小仓位高抛低吸，"
+            "避免在中轴附近频繁进出。"
+        )
+
+    return lines
+
+
 # ========== 构建最终报告 ==========
 def build_micro_report():
     now = datetime.now(CN_TZ)
@@ -577,6 +660,10 @@ def build_micro_report():
         "→ 策略倾向：日内优先结合 4H/1H OB + CPR 结构做顺势单；"
         "短线逆势单只在关键 OB / CPR / 反转带附近轻仓尝试。"
     )
+    lines.append("")
+
+    # ==== 自动策略建议 ====
+    lines.extend(build_auto_strategy_lines(cme, mp, vol, lbma, rating))
 
     return "\n".join(lines)
 
