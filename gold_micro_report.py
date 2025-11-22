@@ -21,22 +21,54 @@ def send_telegram_message(text: str):
     resp.raise_for_status()
 
 
-# ========== CME 成交量 / 持仓量（带重试 + 优雅降级） ==========
+# ========== CME 成交量 / 持仓量（带重试 + CFTC 备选） ==========
+
+def fetch_cftc_weekly_note():
+    """
+    CME 多次超时后的备选信息：给出 CFTC 周度报告链接，避免完全“瞎子摸象”。
+    不去强行解析 txt，只给出说明文字和链接，保证脚本稳定。
+    """
+    try:
+        url = "https://www.cftc.gov/dea/newcot/deafut.txt"
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        # 能访问就认为 CFTC 周报可用，给出手动查看链接
+        note = (
+            "CME 实时接口多次超时，已降级为 CFTC 周度持仓数据；"
+            "建议手动查看周报： https://www.cftc.gov/dea/futures/deafut.htm"
+        )
+    except Exception:
+        note = (
+            "CME 实时接口多次超时，尝试访问 CFTC 周度报告也失败；"
+            "本轮报告忽略持仓维度，仅参考 LBMA / 期权 / TV 结构。"
+        )
+    return {
+        "volume": "—",
+        "oi": "—",
+        "change_oi": "0",
+        "ok": False,
+        "source": "CFTC",
+        "note": note,
+    }
+
 
 def fetch_cme_oi():
     """
     抓取 CME 黄金期货（GC）持仓量 OI / 成交量 Vol
-    增加重试机制：最多尝试 3 次，每次超时 15 秒
+    逻辑：
+      1）优先用 CME 实时接口，最多重试 3 次；
+      2）若仍失败，则降级为 CFTC 周度报告（仅给出说明文字，不强行解析数字）。
     返回 dict:
         {
             "volume": ...,
             "oi": ...,
             "change_oi": ...,
-            "ok": True/False
+            "ok": True/False,
+            "source": "CME" / "CFTC",
+            "note": "说明文字"
         }
     """
     url = "https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/416/G"
-
     last_error = None
 
     for attempt in range(3):
@@ -46,7 +78,6 @@ def fetch_cme_oi():
             data = r.json()
 
             quote = data["quotes"]["quote"][0]
-
             volume = quote.get("volume", "N/A")
             open_interest = quote.get("openInterest", "N/A")
             change_oi = quote.get("changeOpenInterest", "0")
@@ -55,7 +86,9 @@ def fetch_cme_oi():
                 "volume": volume,
                 "oi": open_interest,
                 "change_oi": change_oi,
-                "ok": True
+                "ok": True,
+                "source": "CME",
+                "note": "",
             }
 
         except Exception as e:
@@ -63,13 +96,8 @@ def fetch_cme_oi():
             if attempt < 2:
                 time.sleep(3)
 
-    # 三次都失败，返回优雅降级结果
-    return {
-        "volume": "—",
-        "oi": "—",
-        "change_oi": "0",
-        "ok": False
-    }
+    # 三次都失败，走 CFTC 备选逻辑
+    return fetch_cftc_weekly_note()
 
 
 # ========== 期权 MaxPain / Skew + 波动率 Proxy 模块 ==========
@@ -80,29 +108,27 @@ def get_maxpain_skew_summary():
     - 最近到期合约的 MaxPain 行权价
     - 简单仓位 Skew（Put/Call OI & Volume）
     - 20 日历史波动率 HV + 波动等级（高 / 中等 / 低）
+    - 当日 GLD 现价相对 MaxPain 的偏离幅度 -> 风险提示
+    - GLD 相对反转带（Reversion Zone）的所在位置 -> 反转带说明
     任何一步失败则优雅降级，返回“暂无数据”的提示。
     """
     try:
-        # 1. 获取 GLD 期权链
         ticker = yf.Ticker("GLD")
-
         expiries = ticker.options
         if not expiries:
             raise ValueError("无可用到期日")
 
-        # 取最近到期的那一组
+        # 最近到期
         expiry = expiries[0]
-
         opt_chain = ticker.option_chain(expiry)
         calls = opt_chain.calls.copy()
         puts = opt_chain.puts.copy()
-
         if calls.empty or puts.empty:
             raise ValueError("期权链为空")
 
-        # 2. 获取 GLD 历史数据，用于：
-        #    - 当前现价 spot
-        #    - 20 日年化历史波动率 HV 作为波动率 Proxy
+        # 取 GLD 行情，用于：
+        # - 现价 spot
+        # - 20 日历史波动率 HV
         hist = ticker.history(period="2mo", interval="1d")
         if hist.empty:
             raise ValueError("无法获取 GLD 行情")
@@ -113,7 +139,6 @@ def get_maxpain_skew_summary():
             rets = hist["Close"].pct_change().dropna()
             last20 = rets[-20:]
             if len(last20) > 0:
-                # 20 日日度标准差 → 年化
                 hv_20 = float(last20.std() * math.sqrt(252))
 
         if hv_20 is None:
@@ -139,7 +164,7 @@ def get_maxpain_skew_summary():
                     "趋势与震荡机会并存，需要结合 CPR / OB 结构判断。"
                 )
 
-        # 3. 基础清洗：确保 openInterest / volume 为数字
+        # 基础清洗
         for df in (calls, puts):
             if "openInterest" not in df.columns:
                 df["openInterest"] = 0
@@ -149,27 +174,21 @@ def get_maxpain_skew_summary():
             df["volume"] = df["volume"].fillna(0).astype(float)
             df["strike"] = df["strike"].astype(float)
 
-        # 4. 计算 MaxPain（经典 OI 版本）
+        # 计算 MaxPain
         strikes = sorted(set(calls["strike"]).union(set(puts["strike"])))
         call_oi = dict(zip(calls["strike"], calls["openInterest"]))
         put_oi = dict(zip(puts["strike"], puts["openInterest"]))
 
         best_strike = None
         min_pain = None
-
         for S in strikes:
             total_pain = 0.0
-
-            # Call 部分：S > K 时，卖方需要支付 (S-K) * OI
             for K, oi in call_oi.items():
                 if S > K and oi > 0:
                     total_pain += (S - K) * oi
-
-            # Put 部分：S < K 时，卖方需要支付 (K-S) * OI
             for K, oi in put_oi.items():
                 if S < K and oi > 0:
                     total_pain += (K - S) * oi
-
             if min_pain is None or total_pain < min_pain:
                 min_pain = total_pain
                 best_strike = S
@@ -179,16 +198,15 @@ def get_maxpain_skew_summary():
 
         max_pain = float(best_strike)
 
-        # 5. 反转带（reversion zone）：取 MaxPain 上下相邻两个行权价
+        # 反转带（MaxPain 上下相邻行权价）
         idx = strikes.index(best_strike)
         lower_idx = max(idx - 1, 0)
         upper_idx = min(idx + 1, len(strikes) - 1)
         lower_strike = float(strikes[lower_idx])
         upper_strike = float(strikes[upper_idx])
-
         reversion_zone = f"{lower_strike:.1f} - {upper_strike:.1f}"
 
-        # 6. Skew：用 Put/Call 总 OI & Volume 简化刻画仓位偏向
+        # Skew：Put/Call OI + Volume
         call_oi_total = calls["openInterest"].sum()
         put_oi_total = puts["openInterest"].sum()
         call_vol_total = calls["volume"].sum()
@@ -197,13 +215,11 @@ def get_maxpain_skew_summary():
         oi_ratio = put_oi_total / call_oi_total if call_oi_total > 0 else None
         vol_ratio = put_vol_total / call_vol_total if call_vol_total > 0 else None
 
-        skew_score = 0.0
-        skew_bias = "neutral"
-
         if oi_ratio is None or vol_ratio is None:
+            skew_bias = "neutral"
+            skew_score = 0.0
             skew_comment = "期权仓位数据不足，暂不评估 Skew。"
         else:
-            # 简单把 OI 比 + 成交量比做个综合
             skew_score = float((oi_ratio + vol_ratio) / 2.0)
             if skew_score > 1.2:
                 skew_bias = "bear"
@@ -224,14 +240,65 @@ def get_maxpain_skew_summary():
                     f"Vol≈{vol_ratio:.2f}，多空仓位较均衡。"
                 )
 
-        # 7. 额外信息：MaxPain 相对现价的偏离
-        diff_pct = (max_pain - spot) / spot * 100.0
+        # ========== MaxPain 偏离风险（核心增强） ==========
+        deviation_pct = (spot - max_pain) / max_pain * 100.0  # GLD 相对 MaxPain 的偏离百分比
+        if abs(deviation_pct) < 0.5:
+            deviation_comment = (
+                f"GLD 价格贴近 MaxPain（偏离约 {deviation_pct:.2f}%），"
+                "更偏向围绕中枢震荡；追单前要结合 CPR / OB 位置。"
+            )
+        elif 0.5 <= deviation_pct < 1.5:
+            if deviation_pct > 0:
+                deviation_comment = (
+                    f"GLD 略高于 MaxPain（偏离约 +{deviation_pct:.2f}%），"
+                    "上方追多需谨慎，回踩中枢/反转带后再接多胜率更高。"
+                )
+            else:
+                deviation_comment = (
+                    f"GLD 略低于 MaxPain（偏离约 {deviation_pct:.2f}%），"
+                    "下破空间有限，更倾向于回补中枢；盲目追空风险偏大。"
+                )
+        else:
+            if deviation_pct > 0:
+                deviation_comment = (
+                    f"GLD 明显高于 MaxPain（偏离约 +{deviation_pct:.2f}%），"
+                    "冲高回落/补跌风险上升，不宜高位追多。"
+                )
+            else:
+                deviation_comment = (
+                    f"GLD 明显低于 MaxPain（偏离约 {deviation_pct:.2f}%），"
+                    "超跌反弹/补价差概率高，空单需谨慎。"
+                )
+
+        # ========== 反转带位置说明（Reversion Zone 解释） ==========
+        try:
+            lower_val, upper_val = [float(x.strip()) for x in reversion_zone.split("-")]
+            if lower_val <= spot <= upper_val:
+                reversion_comment = (
+                    "GLD 当前位于反转带内部 → 当日更容易在该区间内震荡/洗盘，"
+                    "适合区间高抛低吸，谨慎突破单。"
+                )
+            elif spot > upper_val:
+                reversion_comment = (
+                    "GLD 位于反转带上方 → 向下回补该区间的概率较高，"
+                    "高位做空要优先参考 OB / CPR 共振位置。"
+                )
+            else:  # spot < lower_val
+                reversion_comment = (
+                    "GLD 位于反转带下方 → 向上反弹回补该区间的概率较高，"
+                    "低位盲目追空风险较大。"
+                )
+        except Exception:
+            reversion_comment = "反转带位置解析失败。"
+
+        # 附加：MaxPain 相对 spot 的简单说明
+        diff_pct_spot = (max_pain - spot) / spot * 100.0
         direction = "上方" if max_pain > spot else "下方"
-        skew_comment += f" 当前 MaxPain≈{max_pain:.1f} ({direction}{abs(diff_pct):.2f}%)。"
+        skew_comment += f" 当前 MaxPain≈{max_pain:.1f}（在现价{direction}{abs(diff_pct_spot):.2f}%）。"
 
         return {
             "underlying": "GLD 期权",
-            "expiry": expiry,                     # 例如 '2025-11-22'
+            "expiry": expiry,
             "max_pain": f"{max_pain:.1f}",
             "reversion_zone": reversion_zone,
             "skew_comment": skew_comment,
@@ -240,10 +307,13 @@ def get_maxpain_skew_summary():
             "hv_20": hv_20,
             "vol_level": vol_level,
             "vol_comment": vol_comment,
+            "spot_gld": spot,
+            "deviation_pct": deviation_pct,
+            "deviation_comment": deviation_comment,
+            "reversion_comment": reversion_comment,
         }
 
     except Exception as e:
-        # 任何错误都优雅降级，避免 TG 里看到一大串英文报错
         return {
             "underlying": "GLD 期权",
             "expiry": "数据获取失败",
@@ -255,23 +325,22 @@ def get_maxpain_skew_summary():
             "hv_20": None,
             "vol_level": "未知",
             "vol_comment": "期权数据获取失败，暂不判断波动环境。",
+            "spot_gld": None,
+            "deviation_pct": None,
+            "deviation_comment": "MaxPain 偏离风险暂不可用。",
+            "reversion_comment": "反转带位置暂不可用。",
         }
 
 
 # ========= GLD → 黄金 XAUUSD 自动换算工具 =========
 
 def gld_to_xau(gld_price: float) -> float:
-    """
-    将 GLD 价格转换为黄金美元价格：
-    黄金价格 ≈ GLD / 0.093
-    """
+    """将 GLD 价格转换为黄金美元价格：黄金价格 ≈ GLD / 0.093"""
     return gld_price / GLD_XAU_RATIO
 
 
 def convert_gld_zone_to_xau(zone_str: str) -> str:
-    """
-    将 '374.0 - 376.0' 形式的反转带转换为黄金价格区间
-    """
+    """将 '374.0 - 376.0' 形式的反转带转换为黄金价格区间"""
     try:
         lower, upper = zone_str.split("-")
         lower = float(lower.strip())
@@ -286,17 +355,13 @@ def convert_gld_zone_to_xau(zone_str: str) -> str:
 # ========== LBMA 定盘价（真实数据） ==========
 
 def _fetch_latest_lbma_fix(url: str):
-    """
-    从 LBMA 官方 JSON 接口获取最新一条（USD 不为 0 的）定盘价记录
-    """
+    """从 LBMA 官方 JSON 接口获取最新一条（USD 不为 0 的）定盘价记录"""
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-
     valid_rows = [row for row in data if row.get("v") and row["v"][0]]
     if not valid_rows:
         raise ValueError("LBMA 数据为空或没有有效价格")
-
     latest = max(valid_rows, key=lambda x: x["d"])
     date_str = latest["d"]
     usd_price = float(latest["v"][0])
@@ -324,7 +389,7 @@ def get_lbma_fixing_summary():
         }
 
     diff = pm_usd - am_usd
-    threshold = 2.0  # 美元差值阈值
+    threshold = 2.0
 
     if diff > threshold:
         comment = (
@@ -352,16 +417,17 @@ def get_lbma_fixing_summary():
     }
 
 
-# ========== 多空结构星级评分（Skew + MaxPain + LBMA） ==========
+# ========== 多空结构星级评分（Skew + LBMA） ==========
 
 def build_bias_rating(cme, mp, lbma):
     """
     综合 Skew + LBMA，给出 -2 ~ +2 的多空评分，并转成星级。
+    CME 在这里不直接打分，只用于结论部分做“真假趋势”参考。
     """
     score = 0
     detail_parts = []
 
-    # 1）期权 Skew 贡献
+    # 期权 Skew
     skew_bias = mp.get("skew_bias", "neutral")
     if skew_bias == "bull":
         score += 1
@@ -372,7 +438,7 @@ def build_bias_rating(cme, mp, lbma):
     else:
         detail_parts.append("期权 Skew 中性（0）")
 
-    # 2）LBMA PM-AM 贡献
+    # LBMA PM-AM
     diff = lbma.get("diff")
     if diff is not None:
         if diff > 2:
@@ -386,7 +452,7 @@ def build_bias_rating(cme, mp, lbma):
     else:
         detail_parts.append("LBMA 数据缺失（0）")
 
-    # 限制在 [-2, 2]
+    # 限制范围
     score = max(-2, min(2, score))
 
     if score == 2:
@@ -401,7 +467,7 @@ def build_bias_rating(cme, mp, lbma):
     elif score == -1:
         stars = "★★☆☆☆ 偏空"
         direction_comment = "整体偏空，反弹到 CPR / OB 上沿更适合做空，多单以短线为主。"
-    else:  # -2
+    else:
         stars = "★☆☆☆☆ 强空头"
         direction_comment = "强空结构，反弹做空为主，谨慎接多，注意控制仓位。"
 
@@ -415,7 +481,7 @@ def build_bias_rating(cme, mp, lbma):
 
 def build_auto_conclusion(cme, mp, lbma, rating):
     """
-    生成综合交易结论：结构评级 + 波动环境 + CME 可信度 + 策略倾向
+    生成综合交易结论：结构评级 + 波动环境 + MaxPain 偏离风险 + CME 真假趋势 + 策略倾向
     """
     parts = []
 
@@ -433,20 +499,29 @@ def build_auto_conclusion(cme, mp, lbma, rating):
     else:
         parts.append("• 波动环境: 数据不足，暂不评价。")
 
-    # CME 可信度
-    if not cme["ok"]:
-        parts.append("• CME：数据缺失 → 以 LBMA + 期权结构为主，CME 暂时忽略。")
+    # MaxPain 偏离风险（直接复用上面计算）
+    dev_pct = mp.get("deviation_pct")
+    dev_comment = mp.get("deviation_comment")
+    if dev_pct is not None:
+        parts.append(f"• MaxPain 偏离: 当前 GLD 相对 MaxPain 偏离约 {dev_pct:.2f}% → {dev_comment}")
+
+    # CME 真假趋势 / 备选 CFTC 说明
+    if cme["source"] == "CFTC":
+        parts.append(f"• CME/CFTC: {cme['note']}")
     else:
-        try:
-            change_oi = int(cme["change_oi"])
-            if change_oi > 0:
-                parts.append("• CME：增仓 → 当前方向更容易延续，不宜重仓逆势。")
-            elif change_oi < 0:
-                parts.append("• CME：减仓 → 当前走势更可能是假突破，适合等待反向确认。")
-            else:
-                parts.append("• CME：持仓平稳 → 容易走震荡或假突破。")
-        except Exception:
-            parts.append("• CME：OI 变化解析失败 → 暂时忽略。")
+        if not cme["ok"]:
+            parts.append("• CME：实时数据缺失 → 以 LBMA + 期权结构为主，CME 暂时忽略。")
+        else:
+            try:
+                change_oi = int(cme["change_oi"])
+                if change_oi > 0:
+                    parts.append("• CME：增仓 → 当前方向更容易延续，不宜重仓逆势。")
+                elif change_oi < 0:
+                    parts.append("• CME：减仓 → 当前走势更可能是假突破，适合等待反向确认。")
+                else:
+                    parts.append("• CME：持仓平稳 → 容易走震荡或假突破。")
+            except Exception:
+                parts.append("• CME：OI 变化解析失败 → 暂时忽略。")
 
     # 策略倾向
     s = rating["score"]
@@ -477,12 +552,17 @@ def build_micro_report():
     lines.append("")
 
     # ==== CME ====
-    lines.append("【CME 期货结构】")
-    if not cme["ok"]:
-        lines.append("• 成交量 Vol: 暂无（CME 接口未响应）")
+    lines.append("【CME / CFTC 持仓结构】")
+    if cme["source"] == "CME" and not cme["ok"]:
+        lines.append("• 成交量 Vol: 暂无（CME 实时接口未响应）")
         lines.append("• 持仓量 OI: 暂无")
         lines.append("• OI变化: 暂无")
-        lines.append("• 评价: 今日暂无法连接 CME，忽略此维度，不影响 LBMA / 期权 / TV 信号。")
+        lines.append("• 评价: 今日暂无法可靠获取 CME 数据，忽略此维度，不影响 LBMA / 期权 / TV 信号。")
+        lines.append("")
+    elif cme["source"] == "CFTC":
+        lines.append("• 数据来源: CFTC 周度持仓报告（CME 实时接口多次超时）")
+        lines.append(f"• 说明: {cme['note']}")
+        lines.append("• 评价: 本报告中不使用具体持仓数字，仅把周度持仓作为背景参考。")
         lines.append("")
     else:
         lines.append(f"• 成交量 Vol: {cme['volume']}")
@@ -501,7 +581,7 @@ def build_micro_report():
         lines.append(f"• 评价: {trend_eval}")
         lines.append("")
 
-    # ==== MaxPain / Skew ====
+    # ==== MaxPain / Skew + 反转带 ====
     lines.append("【期权 MaxPain / Skew】")
     lines.append(f"• 标的: {mp['underlying']}")
     lines.append(f"• 到期日: {mp['expiry']}")
@@ -514,6 +594,9 @@ def build_micro_report():
         xau_zone = convert_gld_zone_to_xau(mp["reversion_zone"])
         lines.append(f"• MaxPain(GLD): {mp['max_pain']}  ≈ XAU {xau_mp:.0f} 美元")
         lines.append(f"• 反转带(GLD): {mp['reversion_zone']}  ≈ XAU {xau_zone} 美元")
+        lines.append(f"• 当前 GLD 价格: {mp['spot_gld']:.2f}，相对 MaxPain 偏离约 {mp['deviation_pct']:.2f}%")
+    lines.append(f"• 偏离风险: {mp['deviation_comment']}")
+    lines.append(f"• 反转带评估: {mp['reversion_comment']}")
     lines.append(f"• Skew评估: {mp['skew_comment']}")
     lines.append("")
 
@@ -541,7 +624,7 @@ def build_micro_report():
     lines.append(f"• 说明: {rating['detail']}")
     lines.append("")
 
-    # ==== 综合结论（自动生成）====
+    # ==== 综合结论 ====
     lines.append("【综合结论】")
     lines.append(build_auto_conclusion(cme, mp, lbma, rating))
 
