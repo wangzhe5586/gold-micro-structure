@@ -11,6 +11,9 @@ CHAT_ID = "6193487818"
 # 北京时间 = UTC+8
 CN_TZ = timezone(timedelta(hours=8))
 
+# GLD -> XAUUSD 价格换算系数（经验值，长期比较稳定）
+GLD_XAU_RATIO = 0.093  # 黄金价格 ≈ GLD / 0.093
+
 
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -69,37 +72,14 @@ def fetch_cme_oi():
     }
 
 
-# ========== 期权 MaxPain / Skew 模块（目前为结构占位，后面可接真实 GLD 期权数据） ==========
+# ========== 期权 MaxPain / Skew + 波动率 Proxy 模块 ==========
 
 def get_maxpain_skew_summary():
-    # ========= GLD → 黄金 XAUUSD 自动换算工具 =========
-
-def gld_to_xau(gld_price):
-    """
-    将 GLD 价格转换为黄金美元价格：
-    黄金价格 ≈ GLD / 0.093
-    """
-    return gld_price / 0.093
-
-
-def convert_gld_zone_to_xau(zone_str):
-    """
-    将 '374.0 - 376.0' 形式的反转带转换为黄金价格区间
-    """
-    try:
-        lower, upper = zone_str.split("-")
-        lower = float(lower.strip())
-        upper = float(upper.strip())
-        xau_lower = gld_to_xau(lower)
-        xau_upper = gld_to_xau(upper)
-        return f"{xau_lower:.0f} - {xau_upper:.0f}"
-    except:
-        return "转换失败"
-
     """
     使用 yfinance 获取 GLD 期权链，计算：
     - 最近到期合约的 MaxPain 行权价
     - 简单仓位 Skew（Put/Call OI & Volume）
+    - 20 日历史波动率 HV + 波动等级（高 / 中等 / 低）
     任何一步失败则优雅降级，返回“暂无数据”的提示。
     """
     try:
@@ -120,13 +100,46 @@ def convert_gld_zone_to_xau(zone_str):
         if calls.empty or puts.empty:
             raise ValueError("期权链为空")
 
-        # 获取当前 GLD 现价（收盘价 / 最近价格）
-        hist = ticker.history(period="1d")
+        # 2. 获取 GLD 历史数据，用于：
+        #    - 当前现价 spot
+        #    - 20 日年化历史波动率 HV 作为波动率 Proxy
+        hist = ticker.history(period="2mo", interval="1d")
         if hist.empty:
             raise ValueError("无法获取 GLD 行情")
         spot = float(hist["Close"].iloc[-1])
 
-        # 2. 基础清洗：确保 openInterest / volume 为数字
+        hv_20 = None
+        if len(hist) >= 20:
+            rets = hist["Close"].pct_change().dropna()
+            last20 = rets[-20:]
+            if len(last20) > 0:
+                # 20 日日度标准差 → 年化
+                hv_20 = float(last20.std() * math.sqrt(252))
+
+        if hv_20 is None:
+            vol_level = "未知"
+            vol_comment = "GLD 历史数据不足，暂无法评估波动环境。"
+        else:
+            if hv_20 > 0.25:
+                vol_level = "高波动"
+                vol_comment = (
+                    f"20 日年化波动率约 {hv_20*100:.1f}%，属于高波动环境，"
+                    "更容易出现大幅单边或假突破，注意控制仓位和止损。"
+                )
+            elif hv_20 < 0.15:
+                vol_level = "低波动"
+                vol_comment = (
+                    f"20 日年化波动率约 {hv_20*100:.1f}%，偏低波动，"
+                    "更容易走区间震荡，目标价不宜拉太远。"
+                )
+            else:
+                vol_level = "中等波动"
+                vol_comment = (
+                    f"20 日年化波动率约 {hv_20*100:.1f}%，处于中等水平，"
+                    "趋势与震荡机会并存，需要结合 CPR / OB 结构判断。"
+                )
+
+        # 3. 基础清洗：确保 openInterest / volume 为数字
         for df in (calls, puts):
             if "openInterest" not in df.columns:
                 df["openInterest"] = 0
@@ -136,9 +149,7 @@ def convert_gld_zone_to_xau(zone_str):
             df["volume"] = df["volume"].fillna(0).astype(float)
             df["strike"] = df["strike"].astype(float)
 
-        # 3. 计算 MaxPain（经典 OI 版本）
-        #    - 遍历所有可能的结算价 S（用所有 strike 作为候选）
-        #    - 对每个 S，计算 Call & Put 的总支付额，取最小值对应的 S 作为 MaxPain
+        # 4. 计算 MaxPain（经典 OI 版本）
         strikes = sorted(set(calls["strike"]).union(set(puts["strike"])))
         call_oi = dict(zip(calls["strike"], calls["openInterest"]))
         put_oi = dict(zip(puts["strike"], puts["openInterest"]))
@@ -168,7 +179,7 @@ def convert_gld_zone_to_xau(zone_str):
 
         max_pain = float(best_strike)
 
-        # 4. 反转带（reversion zone）：取 MaxPain 上下相邻两个行权价
+        # 5. 反转带（reversion zone）：取 MaxPain 上下相邻两个行权价
         idx = strikes.index(best_strike)
         lower_idx = max(idx - 1, 0)
         upper_idx = min(idx + 1, len(strikes) - 1)
@@ -177,7 +188,7 @@ def convert_gld_zone_to_xau(zone_str):
 
         reversion_zone = f"{lower_strike:.1f} - {upper_strike:.1f}"
 
-        # 5. Skew：用 Put/Call 总 OI & Volume 简化刻画仓位偏向
+        # 6. Skew：用 Put/Call 总 OI & Volume 简化刻画仓位偏向
         call_oi_total = calls["openInterest"].sum()
         put_oi_total = puts["openInterest"].sum()
         call_vol_total = calls["volume"].sum()
@@ -186,28 +197,34 @@ def convert_gld_zone_to_xau(zone_str):
         oi_ratio = put_oi_total / call_oi_total if call_oi_total > 0 else None
         vol_ratio = put_vol_total / call_vol_total if call_vol_total > 0 else None
 
+        skew_score = 0.0
+        skew_bias = "neutral"
+
         if oi_ratio is None or vol_ratio is None:
             skew_comment = "期权仓位数据不足，暂不评估 Skew。"
         else:
             # 简单把 OI 比 + 成交量比做个综合
-            skew_score = (oi_ratio + vol_ratio) / 2.0
+            skew_score = float((oi_ratio + vol_ratio) / 2.0)
             if skew_score > 1.2:
+                skew_bias = "bear"
                 skew_comment = (
                     f"Skew 偏空：Put/Call OI≈{oi_ratio:.2f}，"
                     f"Vol≈{vol_ratio:.2f}，防跌/看空对冲仓较多。"
                 )
             elif skew_score < 0.8:
+                skew_bias = "bull"
                 skew_comment = (
                     f"Skew 偏多：Put/Call OI≈{oi_ratio:.2f}，"
                     f"Vol≈{vol_ratio:.2f}，整体偏看涨/压上方。"
                 )
             else:
+                skew_bias = "neutral"
                 skew_comment = (
                     f"Skew 中性：Put/Call OI≈{oi_ratio:.2f}，"
                     f"Vol≈{vol_ratio:.2f}，多空仓位较均衡。"
                 )
 
-        # 6. 额外信息：MaxPain 相对现价的偏离
+        # 7. 额外信息：MaxPain 相对现价的偏离
         diff_pct = (max_pain - spot) / spot * 100.0
         direction = "上方" if max_pain > spot else "下方"
         skew_comment += f" 当前 MaxPain≈{max_pain:.1f} ({direction}{abs(diff_pct):.2f}%)。"
@@ -218,6 +235,11 @@ def convert_gld_zone_to_xau(zone_str):
             "max_pain": f"{max_pain:.1f}",
             "reversion_zone": reversion_zone,
             "skew_comment": skew_comment,
+            "skew_bias": skew_bias,
+            "skew_score": skew_score,
+            "hv_20": hv_20,
+            "vol_level": vol_level,
+            "vol_comment": vol_comment,
         }
 
     except Exception as e:
@@ -228,8 +250,37 @@ def convert_gld_zone_to_xau(zone_str):
             "max_pain": "暂无",
             "reversion_zone": "暂无",
             "skew_comment": f"期权数据获取失败，暂不使用 MaxPain/Skew（{type(e).__name__}）。",
+            "skew_bias": "neutral",
+            "skew_score": 0.0,
+            "hv_20": None,
+            "vol_level": "未知",
+            "vol_comment": "期权数据获取失败，暂不判断波动环境。",
         }
 
+
+# ========= GLD → 黄金 XAUUSD 自动换算工具 =========
+
+def gld_to_xau(gld_price: float) -> float:
+    """
+    将 GLD 价格转换为黄金美元价格：
+    黄金价格 ≈ GLD / 0.093
+    """
+    return gld_price / GLD_XAU_RATIO
+
+
+def convert_gld_zone_to_xau(zone_str: str) -> str:
+    """
+    将 '374.0 - 376.0' 形式的反转带转换为黄金价格区间
+    """
+    try:
+        lower, upper = zone_str.split("-")
+        lower = float(lower.strip())
+        upper = float(upper.strip())
+        xau_lower = gld_to_xau(lower)
+        xau_upper = gld_to_xau(upper)
+        return f"{xau_lower:.0f} - {xau_upper:.0f}"
+    except Exception:
+        return "转换失败"
 
 
 # ========== LBMA 定盘价（真实数据） ==========
@@ -266,7 +317,10 @@ def get_lbma_fixing_summary():
         return {
             "am_fix": f"获取失败（{e}）",
             "pm_fix": f"获取失败（{e}）",
-            "bias_comment": "LBMA 定盘价获取失败，暂时无法根据 Fixing 判断多空基准。"
+            "bias_comment": "LBMA 定盘价获取失败，暂时无法根据 Fixing 判断多空基准。",
+            "am_val": None,
+            "pm_val": None,
+            "diff": None,
         }
 
     diff = pm_usd - am_usd
@@ -291,8 +345,119 @@ def get_lbma_fixing_summary():
     return {
         "am_fix": f"{am_usd:.2f} USD（{am_date}）",
         "pm_fix": f"{pm_usd:.2f} USD（{pm_date}）",
-        "bias_comment": comment
+        "bias_comment": comment,
+        "am_val": am_usd,
+        "pm_val": pm_usd,
+        "diff": diff,
     }
+
+
+# ========== 多空结构星级评分（Skew + MaxPain + LBMA） ==========
+
+def build_bias_rating(cme, mp, lbma):
+    """
+    综合 Skew + LBMA，给出 -2 ~ +2 的多空评分，并转成星级。
+    """
+    score = 0
+    detail_parts = []
+
+    # 1）期权 Skew 贡献
+    skew_bias = mp.get("skew_bias", "neutral")
+    if skew_bias == "bull":
+        score += 1
+        detail_parts.append("期权 Skew 偏多（仓位偏向看涨一侧）（+1）")
+    elif skew_bias == "bear":
+        score -= 1
+        detail_parts.append("期权 Skew 偏空（仓位偏向防跌/看空）（-1）")
+    else:
+        detail_parts.append("期权 Skew 中性（0）")
+
+    # 2）LBMA PM-AM 贡献
+    diff = lbma.get("diff")
+    if diff is not None:
+        if diff > 2:
+            score += 1
+            detail_parts.append("LBMA PM 明显高于 AM，偏多头（+1）")
+        elif diff < -2:
+            score -= 1
+            detail_parts.append("LBMA PM 明显低于 AM，偏空头（-1）")
+        else:
+            detail_parts.append("LBMA PM≈AM，多空均衡（0）")
+    else:
+        detail_parts.append("LBMA 数据缺失（0）")
+
+    # 限制在 [-2, 2]
+    score = max(-2, min(2, score))
+
+    if score == 2:
+        stars = "★★★★★ 强多头"
+        direction_comment = "整体强多头结构，日内以逢低做多为主，空单仅作为短线反弹博弈。"
+    elif score == 1:
+        stars = "★★★★☆ 偏多"
+        direction_comment = "整体偏多，优先考虑顺势多单，高位空单以短线为主。"
+    elif score == 0:
+        stars = "★★★☆☆ 中性震荡"
+        direction_comment = "多空力量接近平衡，适合区间思路，高抛低吸为主，谨慎追单。"
+    elif score == -1:
+        stars = "★★☆☆☆ 偏空"
+        direction_comment = "整体偏空，反弹到 CPR / OB 上沿更适合做空，多单以短线为主。"
+    else:  # -2
+        stars = "★☆☆☆☆ 强空头"
+        direction_comment = "强空结构，反弹做空为主，谨慎接多，注意控制仓位。"
+
+    return {
+        "score": score,
+        "stars": stars,
+        "direction_comment": direction_comment,
+        "detail": "；".join(detail_parts),
+    }
+
+
+def build_auto_conclusion(cme, mp, lbma, rating):
+    """
+    生成综合交易结论：结构评级 + 波动环境 + CME 可信度 + 策略倾向
+    """
+    parts = []
+
+    # 结构评级
+    parts.append(f"• 结构评级: {rating['stars']} → {rating['direction_comment']}")
+
+    # 波动环境
+    vol_level = mp.get("vol_level", "未知")
+    if vol_level == "高波动":
+        parts.append("• 波动环境: 高波动 → 更适合突破/趋势单，止损要更果断。")
+    elif vol_level == "低波动":
+        parts.append("• 波动环境: 低波动 → 更适合区间博弈，止盈目标不宜太远。")
+    elif vol_level == "中等波动":
+        parts.append("• 波动环境: 中等波动 → 趋势与震荡机会并存，重点结合 CPR / OB 区域。")
+    else:
+        parts.append("• 波动环境: 数据不足，暂不评价。")
+
+    # CME 可信度
+    if not cme["ok"]:
+        parts.append("• CME：数据缺失 → 以 LBMA + 期权结构为主，CME 暂时忽略。")
+    else:
+        try:
+            change_oi = int(cme["change_oi"])
+            if change_oi > 0:
+                parts.append("• CME：增仓 → 当前方向更容易延续，不宜重仓逆势。")
+            elif change_oi < 0:
+                parts.append("• CME：减仓 → 当前走势更可能是假突破，适合等待反向确认。")
+            else:
+                parts.append("• CME：持仓平稳 → 容易走震荡或假突破。")
+        except Exception:
+            parts.append("• CME：OI 变化解析失败 → 暂时忽略。")
+
+    # 策略倾向
+    s = rating["score"]
+    if s >= 1:
+        parts.append("→ 策略倾向：日内以 **顺势多单** 为主；4H/1H OB / CPR 上方短空为辅。")
+    elif s <= -1:
+        parts.append("→ 策略倾向：日内以 **反弹做空** 为主；关键支撑附近轻仓多单博反弹。")
+    else:
+        parts.append("→ 策略倾向：**区间震荡思路**，在 OB / CPR 区间两端高抛低吸，避免追高杀跌。")
+
+    return "\n".join(parts)
 
 
 # ========== 构建最终报告 ==========
@@ -304,6 +469,7 @@ def build_micro_report():
     cme = fetch_cme_oi()
     mp = get_maxpain_skew_summary()
     lbma = get_lbma_fixing_summary()
+    rating = build_bias_rating(cme, mp, lbma)
 
     lines = []
     lines.append("📊 黄金微观结构报告")
@@ -339,9 +505,26 @@ def build_micro_report():
     lines.append("【期权 MaxPain / Skew】")
     lines.append(f"• 标的: {mp['underlying']}")
     lines.append(f"• 到期日: {mp['expiry']}")
-    lines.append(f"• MaxPain(GLD): {mp['max_pain']}  ≈ XAU {gld_to_xau(float(mp['max_pain'])):.0f} 美元")
-    lines.append(f"• 反转带(GLD): {mp['reversion_zone']}  ≈ XAU {convert_gld_zone_to_xau(mp['reversion_zone'])} 美元")
-    lines.append(f"• 评估: {mp['skew_comment']}")
+    if mp["max_pain"] == "暂无":
+        lines.append("• MaxPain: 暂无")
+        lines.append("• 反转带: 暂无")
+    else:
+        max_pain_val = float(mp["max_pain"])
+        xau_mp = gld_to_xau(max_pain_val)
+        xau_zone = convert_gld_zone_to_xau(mp["reversion_zone"])
+        lines.append(f"• MaxPain(GLD): {mp['max_pain']}  ≈ XAU {xau_mp:.0f} 美元")
+        lines.append(f"• 反转带(GLD): {mp['reversion_zone']}  ≈ XAU {xau_zone} 美元")
+    lines.append(f"• Skew评估: {mp['skew_comment']}")
+    lines.append("")
+
+    # ==== 波动率 Proxy ====
+    lines.append("【波动率 Proxy】")
+    if mp["hv_20"] is None:
+        lines.append("• 20 日年化波动率: 暂无")
+    else:
+        lines.append(f"• 20 日年化波动率: {mp['hv_20']*100:.1f}%")
+    lines.append(f"• 波动等级: {mp['vol_level']}")
+    lines.append(f"• 评估: {mp['vol_comment']}")
     lines.append("")
 
     # ==== LBMA ====
@@ -350,56 +533,17 @@ def build_micro_report():
     lines.append(f"• PM Fix: {lbma['pm_fix']}")
     lines.append(f"• 评估: {lbma['bias_comment']}")
     lines.append("")
-def build_auto_conclusion(cme, mp, lbma):
-    """
-    根据 CME 成交量 / OI、期权 Skew、MaxPain 偏离、LBMA 定盘价结构
-    自动生成综合多空倾向（专业交易员版）
-    """
 
-    conclusion = []
+    # ==== 多空结构评分 ====
+    lines.append("【多空结构评分】")
+    lines.append(f"• 评级: {rating['stars']}")
+    lines.append(f"• 方向结论: {rating['direction_comment']}")
+    lines.append(f"• 说明: {rating['detail']}")
+    lines.append("")
 
-    # --- 1）CME层 ---
-    if cme["oi"] == "暂无" or cme["volume"] == "暂无":
-        conclusion.append("• CME 数据缺失 → 使用其他因素优先判断。")
-    else:
-        if cme["change_oi"] > 0 and cme["volume"] > 0:
-            conclusion.append("• CME：增仓上涨 → 多头力量偏强。")
-        elif cme["change_oi"] < 0:
-            conclusion.append("• CME：减仓下跌 → 空头主导，趋势延续概率大。")
-        else:
-            conclusion.append("• CME：持仓结构中性。")
-
-    # --- 2）Skew层 ---
-    skew = mp["skew_comment"]
-    if "偏多" in skew:
-        conclusion.append("• Skew：仓位偏多 → 下方支撑较强。")
-    elif "偏空" in skew:
-        conclusion.append("• Skew：仓位偏空 → 上方压力明显。")
-    else:
-        conclusion.append("• Skew：多空结构中性。")
-
-    # --- 3）MaxPain 偏离 ---
-    try:
-        maxpain = float(mp["max_pain"])
-        xau_mp = gld_to_xau(maxpain)
-        lbma_avg = (lbma["am"] + lbma["pm"]) / 2
-
-        diff = (lbma_avg - xau_mp)
-
-        if diff > 8:
-            conclusion.append("• MaxPain：黄金高于 MaxPain 多 → 回调概率更高。")
-        elif diff < -8:
-            conclusion.append("• MaxPain：黄金低于 MaxPain → 易反弹补价差。")
-        else:
-            conclusion.append("• MaxPain：价格围绕中枢 → 更倾向震荡行情。")
-    except:
-        conclusion.append("• MaxPain：数据暂不可用。")
-
-    return "\n".join(conclusion)
-
-    # ==== 综合结论（后续可以再智能化） ====
+    # ==== 综合结论（自动生成）====
     lines.append("【综合结论】")
-    lines.append(build_auto_conclusion(cme, mp, lbma))
+    lines.append(build_auto_conclusion(cme, mp, lbma, rating))
 
     return "\n".join(lines)
 
