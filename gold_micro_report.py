@@ -1,5 +1,6 @@
 import requests
 from datetime import datetime, timedelta, timezone
+import time
 
 # ====== 基本配置（你已经给我的） ======
 BOT_TOKEN = "8053639726:AAE_Kjpin_UGi6rrHDeDRvT9WrYVKUtR3UY"
@@ -20,24 +21,43 @@ def send_telegram_message(text: str):
 def fetch_cme_oi():
     """
     抓取 CME 黄金期货（GC）持仓量 OI / 成交量 Vol
+    增加重试机制：最多尝试 3 次，每次超时 20 秒
     返回 dict
     """
-    try:
-        url = "https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/416/G"
-        r = requests.get(url, timeout=10)
-        data = r.json()
+    url = "https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/416/G"
 
-        quote = data["quotes"]["quote"][0]
+    last_error = None
 
-        volume = quote.get("volume", "N/A")
-        open_interest = quote.get("openInterest", "N/A")
-        change_oi = quote.get("changeOpenInterest", "N/A")
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=20)
+            r.raise_for_status()
+            data = r.json()
 
-        return {
-            "volume": volume,
-            "oi": open_interest,
-            "change_oi": change_oi
-        }
+            quote = data["quotes"]["quote"][0]
+
+            volume = quote.get("volume", "N/A")
+            open_interest = quote.get("openInterest", "N/A")
+            change_oi = quote.get("changeOpenInterest", "N/A")
+
+            return {
+                "volume": volume,
+                "oi": open_interest,
+                "change_oi": change_oi
+            }
+
+        except Exception as e:
+            last_error = e
+            # 前两次失败，稍微等一会儿再重试
+            if attempt < 2:
+                time.sleep(3)
+
+    # 三次都失败，返回 Error 信息
+    return {
+        "volume": "Error",
+        "oi": "Error",
+        "change_oi": f"{type(last_error).__name__}: {last_error}"
+    }
 
     except Exception as e:
         return {
