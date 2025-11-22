@@ -1,6 +1,8 @@
 import requests
 import time
 from datetime import datetime, timedelta, timezone
+import math
+import yfinance as yf
 
 # ====== 基本配置 ======
 BOT_TOKEN = "8053639726:AAE_Kjpin_UGi6rrHDeDRvT9WrYVKUtR3UY"
@@ -71,17 +73,139 @@ def fetch_cme_oi():
 
 def get_maxpain_skew_summary():
     """
-    目前先用占位数据，结构已经搭好，后面可以接 GLD 期权链真实计算：
-      - MaxPain = 使卖方总亏损最小的执行价
-      - Skew = 看多/看空倾斜度（用看涨/看跌隐含波动率差计算）
+    使用 yfinance 获取 GLD 期权链，计算：
+    - 最近到期合约的 MaxPain 行权价
+    - 简单仓位 Skew（Put/Call OI & Volume）
+    任何一步失败则优雅降级，返回“暂无数据”的提示。
     """
-    return {
-        "underlying": "GLD 期权",
-        "expiry": "示例：最近周五到期",
-        "max_pain": "示例：205",
-        "reversion_zone": "示例：204.5 - 205.5",
-        "skew_comment": "示例：Skew 偏空 → 上方压力大，下破支撑后易加速"
-    }
+    try:
+        # 1. 获取 GLD 期权链
+        ticker = yf.Ticker("GLD")
+
+        expiries = ticker.options
+        if not expiries:
+            raise ValueError("无可用到期日")
+
+        # 取最近到期的那一组
+        expiry = expiries[0]
+
+        opt_chain = ticker.option_chain(expiry)
+        calls = opt_chain.calls.copy()
+        puts = opt_chain.puts.copy()
+
+        if calls.empty or puts.empty:
+            raise ValueError("期权链为空")
+
+        # 获取当前 GLD 现价（收盘价 / 最近价格）
+        hist = ticker.history(period="1d")
+        if hist.empty:
+            raise ValueError("无法获取 GLD 行情")
+        spot = float(hist["Close"].iloc[-1])
+
+        # 2. 基础清洗：确保 openInterest / volume 为数字
+        for df in (calls, puts):
+            if "openInterest" not in df.columns:
+                df["openInterest"] = 0
+            if "volume" not in df.columns:
+                df["volume"] = 0
+            df["openInterest"] = df["openInterest"].fillna(0).astype(float)
+            df["volume"] = df["volume"].fillna(0).astype(float)
+            df["strike"] = df["strike"].astype(float)
+
+        # 3. 计算 MaxPain（经典 OI 版本）
+        #    - 遍历所有可能的结算价 S（用所有 strike 作为候选）
+        #    - 对每个 S，计算 Call & Put 的总支付额，取最小值对应的 S 作为 MaxPain
+        strikes = sorted(set(calls["strike"]).union(set(puts["strike"])))
+        call_oi = dict(zip(calls["strike"], calls["openInterest"]))
+        put_oi = dict(zip(puts["strike"], puts["openInterest"]))
+
+        best_strike = None
+        min_pain = None
+
+        for S in strikes:
+            total_pain = 0.0
+
+            # Call 部分：S > K 时，卖方需要支付 (S-K) * OI
+            for K, oi in call_oi.items():
+                if S > K and oi > 0:
+                    total_pain += (S - K) * oi
+
+            # Put 部分：S < K 时，卖方需要支付 (K-S) * OI
+            for K, oi in put_oi.items():
+                if S < K and oi > 0:
+                    total_pain += (K - S) * oi
+
+            if min_pain is None or total_pain < min_pain:
+                min_pain = total_pain
+                best_strike = S
+
+        if best_strike is None:
+            raise ValueError("MaxPain 计算失败")
+
+        max_pain = float(best_strike)
+
+        # 4. 反转带（reversion zone）：取 MaxPain 上下相邻两个行权价
+        idx = strikes.index(best_strike)
+        lower_idx = max(idx - 1, 0)
+        upper_idx = min(idx + 1, len(strikes) - 1)
+        lower_strike = float(strikes[lower_idx])
+        upper_strike = float(strikes[upper_idx])
+
+        reversion_zone = f"{lower_strike:.1f} - {upper_strike:.1f}"
+
+        # 5. Skew：用 Put/Call 总 OI & Volume 简化刻画仓位偏向
+        call_oi_total = calls["openInterest"].sum()
+        put_oi_total = puts["openInterest"].sum()
+        call_vol_total = calls["volume"].sum()
+        put_vol_total = puts["volume"].sum()
+
+        oi_ratio = put_oi_total / call_oi_total if call_oi_total > 0 else None
+        vol_ratio = put_vol_total / call_vol_total if call_vol_total > 0 else None
+
+        if oi_ratio is None or vol_ratio is None:
+            skew_comment = "期权仓位数据不足，暂不评估 Skew。"
+        else:
+            # 简单把 OI 比 + 成交量比做个综合
+            skew_score = (oi_ratio + vol_ratio) / 2.0
+            if skew_score > 1.2:
+                skew_comment = (
+                    f"Skew 偏空：Put/Call OI≈{oi_ratio:.2f}，"
+                    f"Vol≈{vol_ratio:.2f}，防跌/看空对冲仓较多。"
+                )
+            elif skew_score < 0.8:
+                skew_comment = (
+                    f"Skew 偏多：Put/Call OI≈{oi_ratio:.2f}，"
+                    f"Vol≈{vol_ratio:.2f}，整体偏看涨/压上方。"
+                )
+            else:
+                skew_comment = (
+                    f"Skew 中性：Put/Call OI≈{oi_ratio:.2f}，"
+                    f"Vol≈{vol_ratio:.2f}，多空仓位较均衡。"
+                )
+
+        # 6. 额外信息：MaxPain 相对现价的偏离
+        diff_pct = (max_pain - spot) / spot * 100.0
+        direction = "上方" if max_pain > spot else "下方"
+        skew_comment += f" 当前 MaxPain≈{max_pain:.1f} ({direction}{abs(diff_pct):.2f}%)。"
+
+        return {
+            "underlying": "GLD 期权",
+            "expiry": expiry,                     # 例如 '2025-11-22'
+            "max_pain": f"{max_pain:.1f}",
+            "reversion_zone": reversion_zone,
+            "skew_comment": skew_comment,
+        }
+
+    except Exception as e:
+        # 任何错误都优雅降级，避免 TG 里看到一大串英文报错
+        return {
+            "underlying": "GLD 期权",
+            "expiry": "数据获取失败",
+            "max_pain": "暂无",
+            "reversion_zone": "暂无",
+            "skew_comment": f"期权数据获取失败，暂不使用 MaxPain/Skew（{type(e).__name__}）。",
+        }
+
 
 
 # ========== LBMA 定盘价（真实数据） ==========
