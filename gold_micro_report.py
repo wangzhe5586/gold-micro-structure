@@ -15,25 +15,41 @@ def send_telegram_message(text: str):
     resp.raise_for_status()
 
 
-# ========== 四件套占位函数（后面逐个接数据源） ==========
+# ========== CME / CFTC 持仓量抓取模块（真实可用） ==========
 
-def get_cme_summary():
+def fetch_cme_oi():
     """
-    TODO: 用 CME / CFTC 的脚本替换这里。
-    这里先返回一个示例结构，方便你先打通 TG 流程。
+    抓取 CME 黄金期货（GC）持仓量 OI / 成交量 Vol
+    返回 dict
     """
-    return {
-        "symbol": "GC",
-        "volume": "示例: 250k",
-        "oi": "示例: 480k (+12k 增仓)",
-        "comment": "示例: 增仓下跌 → 空头真实力量偏强"
-    }
+    try:
+        url = "https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/416/G"
+        r = requests.get(url, timeout=10)
+        data = r.json()
 
+        quote = data["quotes"]["quote"][0]
+
+        volume = quote.get("volume", "N/A")
+        open_interest = quote.get("openInterest", "N/A")
+        change_oi = quote.get("changeOpenInterest", "N/A")
+
+        return {
+            "volume": volume,
+            "oi": open_interest,
+            "change_oi": change_oi
+        }
+
+    except Exception as e:
+        return {
+            "volume": "Error",
+            "oi": "Error",
+            "change_oi": str(e)
+        }
+
+
+# ========== MaxPain / Skew 占位（后续接真实数据） ==========
 
 def get_maxpain_skew_summary():
-    """
-    TODO: 用 yfinance + open_interest 仓库计算 GLD 的 MaxPain 和 Skew.
-    """
     return {
         "underlying": "GLD 期权",
         "expiry": "示例: 最近周五",
@@ -43,73 +59,46 @@ def get_maxpain_skew_summary():
     }
 
 
-# ...（你原来上面的 BOT_TOKEN、CHAT_ID、CN_TZ 等保持不变）
-
+# ========== LBMA 定盘价（真实数据） ==========
 
 def _fetch_latest_lbma_fix(url: str):
-    """
-    从 LBMA 官方 JSON 接口获取最新一条（USD 不为 0 的）定盘价记录
-    示例接口：
-        AM: https://prices.lbma.org.uk/json/gold_am.json
-        PM: https://prices.lbma.org.uk/json/gold_pm.json
-    返回: (date_str, price_usd)
-    """
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
-    data = resp.json()  # data 是一个列表，每个元素是 {"d": "YYYY-MM-DD", "v": [usd, gbp, eur], ...}
+    data = resp.json()
 
-    # 过滤掉没有价格的数据（v[0] == 0），避免早年数据干扰
     valid_rows = [row for row in data if row.get("v") and row["v"][0]]
     if not valid_rows:
-        raise ValueError("LBMA 数据为空或没有有效价格")
+        raise ValueError("LBMA 数据为空或无有效价格")
 
-    # 按日期排序，取最新一条
     latest = max(valid_rows, key=lambda x: x["d"])
-    date_str = latest["d"]
-    usd_price = float(latest["v"][0])
-    return date_str, usd_price
+    return latest["d"], float(latest["v"][0])
 
 
 def get_lbma_fixing_summary():
-    """
-    真实版 LBMA AM/PM 定盘价：
-    - 从官方 JSON 拿最新一日 AM / PM
-    - 计算 PM - AM 差值
-    - 给出方向文字结论
-    """
     try:
         am_date, am_usd = _fetch_latest_lbma_fix("https://prices.lbma.org.uk/json/gold_am.json")
         pm_date, pm_usd = _fetch_latest_lbma_fix("https://prices.lbma.org.uk/json/gold_pm.json")
     except Exception as e:
-        # 报错时给出提示，但不中断整个日报
         return {
             "am_fix": f"获取失败（{e}）",
             "pm_fix": f"获取失败（{e}）",
-            "bias_comment": "LBMA 定盘价获取失败，暂时无法根据 Fixing 判断多空基准。"
+            "bias_comment": "LBMA 定盘价获取失败，无法判断方向。"
         }
 
-    # 正常情况下 AM/PM 日期应该相同，这里做个保护
-    date_str = pm_date if pm_date == am_date else f"{am_date} / {pm_date}"
-
     diff = pm_usd - am_usd
-
-    # 你可以之后调整这个阈值，现在先给一个稳健的版本
-    threshold = 2.0  # 美元差值阈值，大于 2 认为方向比较明确
+    threshold = 2.0
 
     if diff > threshold:
         comment = (
-            f"PM({pm_usd:.2f}) > AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
-            "整体偏多头主导，回踩支撑后偏多看待。"
+            f"PM({pm_usd:.2f}) > AM({am_usd:.2f})，差值 {diff:.2f} 美元：多头主导。"
         )
     elif diff < -threshold:
         comment = (
-            f"PM({pm_usd:.2f}) < AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
-            "整体偏空头主导，反弹到压力/OB 附近偏空处理。"
+            f"PM({pm_usd:.2f}) < AM({am_usd:.2f})，差值 {diff:.2f} 美元：空头主导。"
         )
     else:
         comment = (
-            f"PM({pm_usd:.2f}) ≈ AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
-            "多空力量均衡，日内更容易震荡或区间博弈。"
+            f"PM({pm_usd:.2f}) ≈ AM({am_usd:.2f})，差值 {diff:.2f} 美元：多空均衡。"
         )
 
     return {
@@ -119,25 +108,44 @@ def get_lbma_fixing_summary():
     }
 
 
+# ========== 构建最终报告 ==========
 
 def build_micro_report():
     now = datetime.now(CN_TZ)
     date_str = now.strftime("%Y-%m-%d %H:%M")
 
-    cme = get_cme_summary()
+    # 抓取三大模块
+    cme = fetch_cme_oi()
     mp = get_maxpain_skew_summary()
     lbma = get_lbma_fixing_summary()
 
     lines = []
-    lines.append(f"📊 黄金微观结构报告")
+    lines.append("📊 黄金微观结构报告")
     lines.append(f"时间（北京）：{date_str}")
     lines.append("")
+
+    # ==== CME ====
     lines.append("【CME 期货结构】")
-    lines.append(f"• 品种: {cme['symbol']}")
-    lines.append(f"• 成交量: {cme['volume']}")
-    lines.append(f"• 持仓量(OI): {cme['oi']}")
-    lines.append(f"• 评估: {cme['comment']}")
+    lines.append(f"• 成交量 Vol: {cme['volume']}")
+    lines.append(f"• 持仓量 OI: {cme['oi']}")
+    lines.append(f"• OI变化: {cme['change_oi']}")
+
+    # 趋势真假逻辑
+    try:
+        change_oi_num = int(cme['change_oi'])
+        if change_oi_num > 0:
+            trend_eval = "增仓 → 趋势真实"
+        elif change_oi_num < 0:
+            trend_eval = "减仓 → 趋势偏假"
+        else:
+            trend_eval = "持仓无明显变化 → 波动反复"
+    except:
+        trend_eval = "数据暂不可用"
+
+    lines.append(f"• 评价: {trend_eval}")
     lines.append("")
+
+    # ==== MaxPain ====
     lines.append("【期权 MaxPain / Skew】")
     lines.append(f"• 标的: {mp['underlying']}")
     lines.append(f"• 到期日: {mp['expiry']}")
@@ -145,15 +153,17 @@ def build_micro_report():
     lines.append(f"• 反转带: {mp['reversion_zone']}")
     lines.append(f"• 评估: {mp['skew_comment']}")
     lines.append("")
+
+    # ==== LBMA ====
     lines.append("【LBMA 定盘价】")
     lines.append(f"• AM Fix: {lbma['am_fix']}")
     lines.append(f"• PM Fix: {lbma['pm_fix']}")
     lines.append(f"• 评估: {lbma['bias_comment']}")
     lines.append("")
-    lines.append("【综合结论（示例逻辑，后续可细化）】")
-    lines.append("• 示例: CME 增仓下跌 + Skew 偏空 + PM>AM：")
-    lines.append("  → 日内偏空主导，反弹到关键阻力/OB 附近优先做空；")
-    lines.append("  → 美盘若放量下破 CPR，下行趋势概率高。")
+
+    # ==== 综合结论（可后续升级 AI 自动生成） ====
+    lines.append("【综合结论（示例逻辑）】")
+    lines.append("• 示例: 若 CME 增仓 + PM>AM → 顺势偏多；若减仓 + Skew 偏空 → 反弹做空。")
 
     return "\n".join(lines)
 
