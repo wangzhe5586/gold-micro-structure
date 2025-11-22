@@ -43,15 +43,81 @@ def get_maxpain_skew_summary():
     }
 
 
+# ...（你原来上面的 BOT_TOKEN、CHAT_ID、CN_TZ 等保持不变）
+
+
+def _fetch_latest_lbma_fix(url: str):
+    """
+    从 LBMA 官方 JSON 接口获取最新一条（USD 不为 0 的）定盘价记录
+    示例接口：
+        AM: https://prices.lbma.org.uk/json/gold_am.json
+        PM: https://prices.lbma.org.uk/json/gold_pm.json
+    返回: (date_str, price_usd)
+    """
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()  # data 是一个列表，每个元素是 {"d": "YYYY-MM-DD", "v": [usd, gbp, eur], ...}
+
+    # 过滤掉没有价格的数据（v[0] == 0），避免早年数据干扰
+    valid_rows = [row for row in data if row.get("v") and row["v"][0]]
+    if not valid_rows:
+        raise ValueError("LBMA 数据为空或没有有效价格")
+
+    # 按日期排序，取最新一条
+    latest = max(valid_rows, key=lambda x: x["d"])
+    date_str = latest["d"]
+    usd_price = float(latest["v"][0])
+    return date_str, usd_price
+
+
 def get_lbma_fixing_summary():
     """
-    TODO: 用 lbma 仓库或 Alpha Vantage 拉昨日 AM/PM Fix.
+    真实版 LBMA AM/PM 定盘价：
+    - 从官方 JSON 拿最新一日 AM / PM
+    - 计算 PM - AM 差值
+    - 给出方向文字结论
     """
+    try:
+        am_date, am_usd = _fetch_latest_lbma_fix("https://prices.lbma.org.uk/json/gold_am.json")
+        pm_date, pm_usd = _fetch_latest_lbma_fix("https://prices.lbma.org.uk/json/gold_pm.json")
+    except Exception as e:
+        # 报错时给出提示，但不中断整个日报
+        return {
+            "am_fix": f"获取失败（{e}）",
+            "pm_fix": f"获取失败（{e}）",
+            "bias_comment": "LBMA 定盘价获取失败，暂时无法根据 Fixing 判断多空基准。"
+        }
+
+    # 正常情况下 AM/PM 日期应该相同，这里做个保护
+    date_str = pm_date if pm_date == am_date else f"{am_date} / {pm_date}"
+
+    diff = pm_usd - am_usd
+
+    # 你可以之后调整这个阈值，现在先给一个稳健的版本
+    threshold = 2.0  # 美元差值阈值，大于 2 认为方向比较明确
+
+    if diff > threshold:
+        comment = (
+            f"PM({pm_usd:.2f}) > AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
+            "整体偏多头主导，回踩支撑后偏多看待。"
+        )
+    elif diff < -threshold:
+        comment = (
+            f"PM({pm_usd:.2f}) < AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
+            "整体偏空头主导，反弹到压力/OB 附近偏空处理。"
+        )
+    else:
+        comment = (
+            f"PM({pm_usd:.2f}) ≈ AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
+            "多空力量均衡，日内更容易震荡或区间博弈。"
+        )
+
     return {
-        "am_fix": "示例: 2405.3",
-        "pm_fix": "示例: 2412.8",
-        "bias_comment": "示例: PM > AM，多头主导，回踩后仍偏多处理"
+        "am_fix": f"{am_usd:.2f} USD（{am_date}）",
+        "pm_fix": f"{pm_usd:.2f} USD（{pm_date}）",
+        "bias_comment": comment
     }
+
 
 
 def build_micro_report():
