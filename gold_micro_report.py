@@ -597,12 +597,12 @@ def build_micro_report():
     # 当前 GLD 价格 + 换算黄金现货
         spot_gld = mp.get("spot_gld")
         if spot_gld is not None:
-    xau_from_gld = gld_to_xau(spot_gld)
-    lines.append(f"• 当前 GLD 价格: {spot_gld:.2f}")
-    lines.append(f"  → 换算为黄金现货价格 ≈ {xau_from_gld:.0f} 美元（仅用于区间参考）")
-    lines.append("  （提示：GLD 为美股收盘价，周一 22:30 开盘后会跳空对齐黄金 XAUUSD）")
-else:
-    lines.append("• 当前 GLD 价格: 暂无")
+        xau_from_gld = gld_to_xau(spot_gld)
+        lines.append(f"• 当前 GLD 价格: {spot_gld:.2f}")
+        lines.append(f"  → 换算为黄金现货价格 ≈ {xau_from_gld:.0f} 美元（仅用于区间参考）")
+        lines.append("  （提示：GLD 为美股收盘价，周一 22:30 开盘后会跳空对齐黄金 XAUUSD）")
+        else:
+        lines.append("• 当前 GLD 价格: 暂无")
 
     lines.append(f"• 偏离风险: {mp['deviation_comment']}")
     lines.append(f"• 反转带评估: {mp['reversion_comment']}")
