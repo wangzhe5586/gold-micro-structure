@@ -594,7 +594,16 @@ def build_micro_report():
         xau_zone = convert_gld_zone_to_xau(mp["reversion_zone"])
         lines.append(f"• MaxPain(GLD): {mp['max_pain']}  ≈ XAU {xau_mp:.0f} 美元")
         lines.append(f"• 反转带(GLD): {mp['reversion_zone']}  ≈ XAU {xau_zone} 美元")
-        lines.append(f"• 当前 GLD 价格: {mp['spot_gld']:.2f}，相对 MaxPain 偏离约 {mp['deviation_pct']:.2f}%")
+    # 当前 GLD 价格 + 换算黄金现货
+        spot_gld = mp.get("spot_gld")
+        if spot_gld is not None:
+    xau_from_gld = gld_to_xau(spot_gld)
+    lines.append(f"• 当前 GLD 价格: {spot_gld:.2f}")
+    lines.append(f"  → 换算为黄金现货价格 ≈ {xau_from_gld:.0f} 美元（仅用于区间参考）")
+    lines.append("  （提示：GLD 为美股收盘价，周一 22:30 开盘后会跳空对齐黄金 XAUUSD）")
+else:
+    lines.append("• 当前 GLD 价格: 暂无")
+
     lines.append(f"• 偏离风险: {mp['deviation_comment']}")
     lines.append(f"• 反转带评估: {mp['reversion_comment']}")
     lines.append(f"• Skew评估: {mp['skew_comment']}")
