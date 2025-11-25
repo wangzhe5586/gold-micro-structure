@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 import math
 import yfinance as yf
 
+
+# ========= LBMA 定盘价 =========
 def get_lbma_fix(session="AM"):
     """
     简化版 LBMA 定盘价获取函数
@@ -15,7 +17,6 @@ def get_lbma_fix(session="AM"):
 
     try:
         r = requests.get(url, timeout=10).json()
-
         if "data" not in r:
             return None
 
@@ -24,27 +25,28 @@ def get_lbma_fix(session="AM"):
             return float(fix.get("am", None))
         elif session == "PM":
             return float(fix.get("pm", None))
-
         return None
-
     except:
         return None
 
+
 # ========= 配置 =========
-BOT_TOKEN = "8053639726:AAE_Kjpin_UGi6rrHDeDRvT9WrYVKUtR3UY"
-CHAT_ID = "6193487818"
+# 这里请换成你自己仓库里的 BOT_TOKEN / CHAT_ID
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+
 CN_TZ = timezone(timedelta(hours=8))
 
-# GLD → XAU 近似换算：结构参考（不是实盘）
+# GLD → XAU 近似换算：**结构参考（不是实盘价）**
 GLD_TO_XAU = 10.75
 
 
-def send_telegram(text):
+def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": CHAT_ID, "text": text})
 
 
-# ========== CME OI（含重试） ==========
+# ========= CME OI（含重试） =========
 def fetch_cme():
     url = "https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/416/G"
     for _ in range(3):
@@ -62,16 +64,16 @@ def fetch_cme():
             time.sleep(2)
 
     return {"ok": False}
-# ========= 获取短期（≤10 天）GLD 期权链 ==========
-def get_short_term_option_chain(ticker):
+
+
+# ========= 获取短期（≤10 天）GLD 期权链 =========
+def get_short_term_option_chain(ticker: yf.Ticker):
     today = datetime.now().date()
 
-    # 所有到期日
     expiries = ticker.options
     if not expiries:
         return None, None
 
-    # 找到未来 ≤10 天的到期日
     def parse(d):
         try:
             return datetime.strptime(d, "%Y-%m-%d").date()
@@ -88,7 +90,6 @@ def get_short_term_option_chain(ticker):
         # 没有短期期权 → 跳过此模块
         return None, None
 
-    # 选择“到期日最近 & 成交活跃度最高”的那个
     near_sorted = sorted(near, key=lambda x: x[1])
     valid_expiries = [e[0] for e in near_sorted]
 
@@ -126,7 +127,7 @@ def get_short_term_option_chain(ticker):
     return best_expiry, best_data
 
 
-# ========= 计算短期 MaxPain / Skew ==========
+# ========= 计算短期 MaxPain / Skew =========
 def calc_short_term_maxpain():
     ticker = yf.Ticker("GLD")
 
@@ -138,7 +139,6 @@ def calc_short_term_maxpain():
     spot = float(hist["Close"].iloc[-1])
 
     expiry, data = get_short_term_option_chain(ticker)
-
     if expiry is None:
         return {
             "ok": False,
@@ -147,10 +147,9 @@ def calc_short_term_maxpain():
 
     calls, puts = data
 
-    # 过滤“接近现价 ±15%”的行权价
+    # 只看接近现价 ±15% 的行权价，避免远月/垃圾档干扰
     lo = spot * 0.85
     hi = spot * 1.15
-
     calls = calls[(calls["strike"] >= lo) & (calls["strike"] <= hi)]
     puts = puts[(puts["strike"] >= lo) & (puts["strike"] <= hi)]
 
@@ -168,7 +167,7 @@ def calc_short_term_maxpain():
     best_pain = None
 
     for S in strikes:
-        pain = 0
+        pain = 0.0
         for K, oi in call_oi.items():
             if S > K and oi > 0:
                 pain += (S - K) * oi
@@ -187,14 +186,10 @@ def calc_short_term_maxpain():
     low = strikes[max(0, idx - 1)]
     high = strikes[min(len(strikes) - 1, idx + 1)]
 
-    # Skew
+    # Skew：总 Put OI / 总 Call OI
     call_oi_t = calls["openInterest"].sum()
     put_oi_t = puts["openInterest"].sum()
-
-    if call_oi_t > 0:
-        skew = put_oi_t / call_oi_t
-    else:
-        skew = None
+    skew = put_oi_t / call_oi_t if call_oi_t > 0 else None
 
     return {
         "ok": True,
@@ -207,44 +202,45 @@ def calc_short_term_maxpain():
         "skew": skew,
         "dev": (spot - best_strike) / best_strike * 100,
     }
-    # ==== LBMA 定盘价（精简版） ====
-lbma_am = get_lbma_fix("AM")
-lbma_pm = get_lbma_fix("PM")
 
-lines.append("【LBMA 定盘价（精简）】")
-lines.append(f"• AM Fix: {lbma_am} USD")
-lines.append(f"• PM Fix: {lbma_pm} USD")
 
-# 一句话判断
-if lbma_pm > lbma_am:
-    lbma_comment = "PM > AM → 偏多（多头主导）"
-else:
-    lbma_comment = "PM < AM → 偏空（空头主导）"
+# ========= 波动率 Proxy（20 日 HV） =========
+def get_hist_volatility(symbol: str, window: int = 20):
+    """
+    简单历史波动率：收盘价收益率标准差 * sqrt(252)
+    返回：年化波动率（百分比），失败返回 None
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        # 取 3 倍窗口长度的数据，保证样本数量
+        hist = ticker.history(period=f"{window * 3}d")
+        if hist.empty:
+            return None
 
-lines.append(f"• 结论: {lbma_comment}")
-lines.append("")
-# ==== 波动率 Proxy（精简版） ====
-hv20 = get_hist_volatility("GLD", window=20)
+        ret = hist["Close"].pct_change().dropna()
+        if ret.empty:
+            return None
 
-lines.append("【波动率 Proxy（精简）】")
-lines.append(f"• 20 日年化波动率: {hv20:.2f}%")
+        daily_vol = ret.std()
+        hv = daily_vol * math.sqrt(252) * 100
+        return float(hv)
+    except:
+        return None
 
-if hv20 >= 22:
-    hv_comment = "高波动 → 容易出现突破单（日内波动大）"
-elif hv20 >= 17:
-    hv_comment = "中等波动 → 趋势/震荡并存，需要结合 CPR/OB 判断"
-else:
-    hv_comment = "低波动 → 偏震荡，突破概率低"
-
-lines.append(f"• 结论: {hv_comment}")
-lines.append("")
 
 # ========= 生成报告 ==========
 def build_report():
-
     now = datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M")
+
     cme = fetch_cme()
     op = calc_short_term_maxpain()
+
+    # LBMA 定盘价（精简）
+    lbma_am = get_lbma_fix("AM")
+    lbma_pm = get_lbma_fix("PM")
+
+    # 波动率 Proxy（精简）
+    hv20 = get_hist_volatility("GLD", window=20)
 
     lines = []
     lines.append("📊 黄金微观结构报告（短期版·适合未来 1–5 天）")
@@ -253,7 +249,6 @@ def build_report():
 
     # ==== 期权 MaxPain / Skew ====
     lines.append("【GLD 短期期权 MaxPain / Skew】")
-
     if not op["ok"]:
         lines.append(f"• {op['msg']}")
         lines.append("• 本次以 LBMA / CME / 波动率为主。")
@@ -277,19 +272,50 @@ def build_report():
                 lines.append(f"• Skew：{op['skew']:.2f}（中性）")
         lines.append("")
 
+    # ==== LBMA 定盘价（精简）====
+    lines.append("【LBMA 定盘价（精简）】")
+    lines.append(f"• AM Fix: {lbma_am} USD")
+    lines.append(f"• PM Fix: {lbma_pm} USD")
+    if lbma_am is not None and lbma_pm is not None:
+        if lbma_pm > lbma_am:
+            lbma_comment = "PM > AM → 偏多（多头主导）"
+        elif lbma_pm < lbma_am:
+            lbma_comment = "PM < AM → 偏空（空头主导）"
+        else:
+            lbma_comment = "PM ≈ AM → 中性"
+    else:
+        lbma_comment = "本次 LBMA 获取失败，仅作背景参考。"
+    lines.append(f"• 结论: {lbma_comment}")
+    lines.append("")
+
+    # ==== 波动率 Proxy（精简）====
+    lines.append("【波动率 Proxy（精简）】")
+    if hv20 is None:
+        lines.append("• 20 日年化波动率: 数据获取失败")
+        hv_comment = "波动率暂不可用，行情节奏以图表结构为主。"
+    else:
+        lines.append(f"• 20 日年化波动率: {hv20:.2f}%")
+        if hv20 >= 22:
+            hv_comment = "高波动 → 容易出现趋势突破单（日内波动大）。"
+        elif hv20 >= 17:
+            hv_comment = "中等波动 → 趋势/震荡并存，需要结合 CPR / OB 结构。"
+        else:
+            hv_comment = "低波动 → 偏震荡，突破概率低。"
+    lines.append(f"• 结论: {hv_comment}")
+    lines.append("")
+
     # ==== CME ====
     lines.append("【CME 黄金期货（GC）】")
     if not cme["ok"]:
-        lines.append("• CME 数据获取失败 → 以 CFTC 周度为背景参考")
+        lines.append("• CME 数据获取失败 → 以 CFTC 周度为背景参考。")
     else:
         lines.append(f"• 成交量 Vol：{cme['volume']}")
         lines.append(f"• 持仓量 OI：{cme['oi']}")
-        lines.append(f"• OI变化：{cme['ch']}")
+        lines.append(f"• OI 变化：{cme['ch']}")
     lines.append("")
 
-    # ==== 综合方向 ====
+    # ==== 综合短期方向（1–5 天）====
     lines.append("【短期方向（1–5 天）】")
-
     if op["ok"]:
         if op["dev"] > 1:
             lines.append("→ GLD 明显高于 MaxPain（>1%），短期偏回落。")
@@ -298,7 +324,7 @@ def build_report():
         else:
             lines.append("→ GLD 贴近短期 MaxPain，短期偏震荡。")
     else:
-        lines.append("→ 未能获取短期 MaxPain，本次以 LBMA/CME 为主。")
+        lines.append("→ 未能获取短期 MaxPain，本次以 LBMA / CME / 波动率为主。")
 
     lines.append("")
 
