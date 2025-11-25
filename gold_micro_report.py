@@ -6,70 +6,40 @@ import yfinance as yf
 
 
 # ========= LBMA 定盘价 =========
-def _fetch_latest_lbma_fix(url: str):
+def get_lbma_fix(session="AM"):
     """
-    从 LBMA 官方 JSON 接口获取最新一条（USD 不为 0 的）定盘价记录
+    获取 LBMA 定盘价：AM 和 PM
+    来源：LBMA 官方 JSON 数据接口
+    session: "AM" 或 "PM"
+    返回 float 或 None
     """
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
+    url = "https://prices.lbma.org.uk/json/gold_am.json" if session == "AM" else "https://prices.lbma.org.uk/json/gold_pm.json"
+    
+    retry_count = 3  # 最大重试次数
+    for _ in range(retry_count):
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()  # 处理 HTTP 错误
 
-    valid_rows = [row for row in data if row.get("v") and row["v"][0]]
-    if not valid_rows:
-        raise ValueError("LBMA 数据为空或没有有效价格")
+            data = r.json()
+            if "v" not in data or not data["v"]:
+                print(f"获取数据失败: 没有 'v' 字段 或 空数据。")
+                return None  # 如果没有有效数据，返回 None
 
-    latest = max(valid_rows, key=lambda x: x["d"])
-    date_str = latest["d"]
-    usd_price = float(latest["v"][0])
-    return date_str, usd_price
+            # 获取定盘价
+            return float(data["v"][0])  # 返回美元价格
 
+        except requests.exceptions.RequestException as e:
+            print(f"请求失败，正在重试... 错误: {e}")
+            time.sleep(2)  # 等待2秒再重试
+        except Exception as e:
+            print(f"数据处理失败，错误: {e}")
+            return None  # 异常时返回 None
 
-def get_lbma_fixing_summary():
-    """
-    真实版 LBMA AM/PM 定盘价：
-    - 从官方 JSON 拿最新一日 AM / PM
-    - 计算 PM - AM 差值
-    - 给出方向文字结论
-    """
-    try:
-        am_date, am_usd = _fetch_latest_lbma_fix("https://prices.lbma.org.uk/json/gold_am.json")
-        pm_date, pm_usd = _fetch_latest_lbma_fix("https://prices.lbma.org.uk/json/gold_pm.json")
-    except Exception as e:
-        return {
-            "am_fix": f"获取失败（{e}）",
-            "pm_fix": f"获取失败（{e}）",
-            "bias_comment": "LBMA 定盘价获取失败，暂时无法根据 Fixing 判断多空基准。",
-            "bias_score": 0.0,
-        }
+    # 如果重试了几次仍然失败
+    print(f"重试 {retry_count} 次仍然失败，返回 None")
+    return None  # 如果重试失败，返回 None
 
-    diff = pm_usd - am_usd
-    threshold = 2.0  # 美元差值阈值
-
-    if diff > threshold:
-        comment = (
-            f"PM({pm_usd:.2f}) > AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
-            "整体偏多头主导，回踩支撑后偏多看待。"
-        )
-        bias_score = 1.0
-    elif diff < -threshold:
-        comment = (
-            f"PM({pm_usd:.2f}) < AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
-            "整体偏空头主导，反弹到压力/OB 附近偏空处理。"
-        )
-        bias_score = -1.0
-    else:
-        comment = (
-            f"PM({pm_usd:.2f}) ≈ AM({am_usd:.2f})，差值约 {diff:.2f} 美元："
-            "多空力量均衡，日内更容易震荡或区间博弈。"
-        )
-        bias_score = 0.0
-
-    return {
-        "am_fix": f"{am_usd:.2f} USD（{am_date}）",
-        "pm_fix": f"{pm_usd:.2f} USD（{pm_date}）",
-        "bias_comment": comment,
-        "bias_score": bias_score,
-    }
 
 # ========= 配置 =========
 # 这里请换成你自己仓库里的 BOT_TOKEN / CHAT_ID
