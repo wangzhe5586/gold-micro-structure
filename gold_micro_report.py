@@ -1,4 +1,3 @@
-import os
 import requests
 import time
 from datetime import datetime, timedelta, timezone
@@ -15,55 +14,11 @@ CN_TZ = timezone(timedelta(hours=8))
 # GLD → XAU 换算系数（经验值，大约 1 股 GLD ≈ 0.093 盎司黄金）
 GLD_TO_XAU_FACTOR = 10.75  # 仅用于区间参考，不作为精确报价
 
-# Polygon API（从环境变量读取，避免泄露）
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-POLYGON_BASE = "https://api.polygon.io"
-
 
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     resp = requests.post(url, data={"chat_id": CHAT_ID, "text": text})
     resp.raise_for_status()
-
-
-# ========== Polygon 工具：获取 GLD 日线历史 ==========
-def fetch_gld_history_from_polygon(days: int = 60):
-    """
-    从 Polygon 获取 GLD 最近 N 天日线数据
-    返回按日期排序的列表: [{'date': date, 'close': float}, ...]
-    """
-    if not POLYGON_API_KEY:
-        raise RuntimeError("未配置 POLYGON_API_KEY")
-
-    end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=days + 5)  # 多取几天防止节假日
-
-    url = (
-        f"{POLYGON_BASE}/v2/aggs/ticker/GLD/range/1/day/"
-        f"{start_date}/{end_date}?adjusted=true&sort=asc&limit=200&apiKey={POLYGON_API_KEY}"
-    )
-
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-
-    results = data.get("results") or []
-    if not results:
-        raise RuntimeError(f"Polygon GLD 返回空结果: {data}")
-
-    bars = []
-    for bar in results:
-        # t: 毫秒时间戳, c: 收盘价
-        ts = bar["t"] / 1000
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
-        close = float(bar["c"])
-        if dt <= end_date:
-            bars.append({"date": dt, "close": close})
-
-    if not bars:
-        raise RuntimeError("Polygon GLD 无有效日线数据")
-
-    return bars
 
 
 # ========== CME 成交量 / 持仓量（带重试 + 优雅降级） ==========
@@ -125,69 +80,93 @@ def gld_to_xau(price: float) -> float:
     return float(price) * GLD_TO_XAU_FACTOR
 
 
-# ========== 期权 MaxPain / Skew / 反转带 ==========
+# ========== ★ 近月 MaxPain / Skew 核心模块 ==========
 def get_maxpain_skew_summary():
     """
-    使用 yfinance 获取 GLD 期权链，计算：
-    - 最近到期合约的 MaxPain 行权价
-    - 反转带（上下相邻两个行权价）
-    - Skew（Put/Call OI & Volume）
-    - 当前 GLD 价格 & 对应 XAUUSD 估算（优先使用 Polygon）
+    使用 yfinance 获取 GLD 期权链，重点使用【近月、近价】期权计算：
+    - 近月 MaxPain 行权价（过滤远离现价、无成交/无持仓的虚假行权价）
+    - 近月反转带（上下相邻两个有效行权价）
+    - Skew（基于近月、近价的 Put/Call OI & Volume）
+    - 当前 GLD 收盘价 & 对应 XAUUSD 估算
     - MaxPain 偏离风险 & 反转带评估
-    任何一步失败则优雅降级。
+
+    说明：
+    - 仅使用「近月」+「接近现价」的期权构建 MaxPain，避免远月老仓干扰。
+    - 只作为结构参考，不作为开仓价位。
     """
     try:
         ticker = yf.Ticker("GLD")
+
+        # 先获取一个大致的 GLD 现价（收盘），用于筛选近价行权价
+        hist = ticker.history(period="5d")
+        if hist.empty:
+            raise ValueError("无法获取 GLD 行情历史")
+        spot = float(hist["Close"].iloc[-1])
 
         expiries = ticker.options
         if not expiries:
             raise ValueError("无可用到期日")
 
-        # 取最近到期的那一组
-        expiry = expiries[0]
+        # -----------------------------
+        # ① 在多个到期日中，选择【近月 & 活跃】的那个
+        # -----------------------------
+        candidate_info = []  # (expiry, score, calls_df, puts_df)
 
-        opt_chain = ticker.option_chain(expiry)
-        calls = opt_chain.calls.copy()
-        puts = opt_chain.puts.copy()
+        # 只看前 6 个到期日，防止过远
+        for expiry in expiries[:6]:
+            try:
+                opt_chain = ticker.option_chain(expiry)
+                calls = opt_chain.calls.copy()
+                puts = opt_chain.puts.copy()
+                if calls.empty and puts.empty:
+                    continue
 
-        if calls.empty or puts.empty:
-            raise ValueError("期权链为空")
+                # 基础清洗
+                for df in (calls, puts):
+                    if "openInterest" not in df.columns:
+                        df["openInterest"] = 0
+                    if "volume" not in df.columns:
+                        df["volume"] = 0
+                    df["openInterest"] = df["openInterest"].fillna(0).astype(float)
+                    df["volume"] = df["volume"].fillna(0).astype(float)
+                    df["strike"] = df["strike"].astype(float)
 
-        # 当前 GLD 收盘价：优先 Polygon，其次 yfinance
-        spot = None
-        spot_date = None
-        spot_source = None
+                # 只保留接近现价的一段行权价（例如 ±25%）
+                min_strike = spot * 0.75
+                max_strike = spot * 1.25
+                calls_n = calls[(calls["strike"] >= min_strike) & (calls["strike"] <= max_strike)]
+                puts_n = puts[(puts["strike"] >= min_strike) & (puts["strike"] <= max_strike)]
 
-        try:
-            bars = fetch_gld_history_from_polygon(days=7)
-            if bars:
-                last_bar = bars[-1]
-                spot = float(last_bar["close"])
-                spot_date = last_bar["date"]
-                spot_source = "Polygon"
-        except Exception:
-            spot = None
+                if calls_n.empty and puts_n.empty:
+                    continue
 
-        if spot is None:
-            hist = ticker.history(period="5d")
-            if hist.empty:
-                raise ValueError("无法获取 GLD 行情")
-            spot = float(hist["Close"].iloc[-1])
-            spot_date = hist.index[-1].date()
-            spot_source = "yfinance"
+                # 计算这一到期日的“活跃度”：近价区域的总 OI + Volume
+                total_oi = calls_n["openInterest"].sum() + puts_n["openInterest"].sum()
+                total_vol = calls_n["volume"].sum() + puts_n["volume"].sum()
+                score = total_oi * 1.0 + total_vol * 0.1
 
-        # 基础清洗：确保 openInterest / volume 为数字
-        for df in (calls, puts):
-            if "openInterest" not in df.columns:
-                df["openInterest"] = 0
-            if "volume" not in df.columns:
-                df["volume"] = 0
-            df["openInterest"] = df["openInterest"].fillna(0).astype(float)
-            df["volume"] = df["volume"].fillna(0).astype(float)
-            df["strike"] = df["strike"].astype(float)
+                if total_oi <= 0 and total_vol <= 0:
+                    continue
 
-        # 计算 MaxPain
+                candidate_info.append((expiry, score, calls_n, puts_n))
+            except Exception:
+                continue
+
+        if not candidate_info:
+            raise ValueError("近月期权数据不足，无法计算 MaxPain")
+
+        # 按活跃度从高到低排序，取最活跃的作为“近月主力到期日”
+        candidate_info.sort(key=lambda x: x[1], reverse=True)
+        chosen_expiry, _, calls, puts = candidate_info[0]
+
+        # -----------------------------
+        # ② 使用近月 + 近价的行权价计算 MaxPain
+        # -----------------------------
         strikes = sorted(set(calls["strike"]).union(set(puts["strike"])))
+        if not strikes:
+            raise ValueError("无有效行权价")
+
+        # 构建每个行权价的 OI 映射
         call_oi = dict(zip(calls["strike"], calls["openInterest"]))
         put_oi = dict(zip(puts["strike"], puts["openInterest"]))
 
@@ -212,11 +191,11 @@ def get_maxpain_skew_summary():
                 best_strike = S
 
         if best_strike is None:
-            raise ValueError("MaxPain 计算失败")
+            raise ValueError("MaxPain 计算失败（无最小痛点）")
 
         max_pain = float(best_strike)
 
-        # 反转带：MaxPain 上下相邻两个行权价
+        # 反转带：MaxPain 上下相邻两个行权价（同样基于近价过滤后的 strikes）
         idx = strikes.index(best_strike)
         lower_idx = max(idx - 1, 0)
         upper_idx = min(idx + 1, len(strikes) - 1)
@@ -224,7 +203,9 @@ def get_maxpain_skew_summary():
         upper_strike = float(strikes[upper_idx])
         reversion_zone = (lower_strike, upper_strike)
 
-        # Skew：用 Put/Call 总 OI & Volume 简化刻画仓位偏向
+        # -----------------------------
+        # ③ Skew：基于近月、近价的总 OI / Volume
+        # -----------------------------
         call_oi_total = calls["openInterest"].sum()
         put_oi_total = puts["openInterest"].sum()
         call_vol_total = calls["volume"].sum()
@@ -234,87 +215,76 @@ def get_maxpain_skew_summary():
         vol_ratio = put_vol_total / call_vol_total if call_vol_total > 0 else None
 
         if oi_ratio is None or vol_ratio is None:
-            skew_comment = "期权仓位数据不足，暂不评估 Skew。"
+            skew_comment = "近月期权仓位数据不足，暂不评估 Skew。"
         else:
             skew_score = (oi_ratio + vol_ratio) / 2.0
             if skew_score > 1.2:
                 skew_comment = (
-                    f"Skew 偏空：Put/Call OI≈{oi_ratio:.2f}，"
+                    f"近月 Skew 偏空：Put/Call OI≈{oi_ratio:.2f}，"
                     f"Vol≈{vol_ratio:.2f}，防跌/看空对冲仓较多。"
                 )
             elif skew_score < 0.8:
                 skew_comment = (
-                    f"Skew 偏多：Put/Call OI≈{oi_ratio:.2f}，"
+                    f"近月 Skew 偏多：Put/Call OI≈{oi_ratio:.2f}，"
                     f"Vol≈{vol_ratio:.2f}，整体偏看涨/压上方。"
                 )
             else:
                 skew_comment = (
-                    f"Skew 中性：Put/Call OI≈{oi_ratio:.2f}，"
+                    f"近月 Skew 中性：Put/Call OI≈{oi_ratio:.2f}，"
                     f"Vol≈{vol_ratio:.2f}，多空仓位较均衡。"
                 )
 
-        # MaxPain 偏离
+        # -----------------------------
+        # ④ MaxPain 偏离（使用 GLD 收盘价）
+        # -----------------------------
         deviation_pct = (spot - max_pain) / max_pain * 100.0
 
         if abs(deviation_pct) < 0.5:
             deviation_comment = (
-                f"GLD 价格贴近 MaxPain（偏离约 {deviation_pct:.2f}%），"
+                f"GLD 价格贴近近月 MaxPain（偏离约 {deviation_pct:.2f}%），"
                 "更偏向围绕中枢震荡；追单前要结合 CPR / OB 位置。"
             )
         elif abs(deviation_pct) < 1.5:
             deviation_comment = (
-                f"GLD 相对 MaxPain 有一定偏离（约 {deviation_pct:.2f}%），"
-                "存在回补/回归 MaxPain 的可能，注意反向波动风险。"
+                f"GLD 相对近月 MaxPain 有一定偏离（约 {deviation_pct:.2f}%），"
+                "存在回补/回归中枢的可能，注意反向波动风险。"
             )
         else:
             deviation_comment = (
-                f"GLD 明显偏离 MaxPain（约 {deviation_pct:.2f}%），"
+                f"GLD 明显偏离近月 MaxPain（约 {deviation_pct:.2f}%），"
                 "大资金博弈激烈，补价/反向拉扯概率较高，谨慎追单。"
             )
 
-        # 反转带评估
-        if lower_strike <= spot <= upper_strike:
-            reversion_comment = (
-                "GLD 当前位于反转带内部 → 当日更容易在该区间内震荡/洗盘，"
-                "适合区间高抛低吸，谨慎突破单。"
-            )
-        elif spot > upper_strike:
-            reversion_comment = (
-                "GLD 当前在反转带上方 → 上方压力带附近容易出现冲高回落，"
-                "注意在上沿附近寻找做空/减仓机会。"
-            )
-        else:
-            reversion_comment = (
-                "GLD 当前在反转带下方 → 下方支撑附近容易出现止跌反弹，"
-                "注意在下沿附近寻找低吸/止损位置。"
-            )
-
-        # GLD → XAU 换算
+        # -----------------------------
+        # ⑤ GLD → XAU 换算（结构区间）
+        # -----------------------------
         xau_mp = gld_to_xau(max_pain)
         xau_zone_low = gld_to_xau(lower_strike)
         xau_zone_high = gld_to_xau(upper_strike)
         xau_spot = gld_to_xau(spot)
 
         return {
-            "underlying": "GLD 期权",
-            "expiry": expiry,
+            "underlying": "GLD 近月期权",
+            "expiry": chosen_expiry,
             "max_pain_gld": max_pain,
             "max_pain_xau": xau_mp,
-            "reversion_zone_gld": (lower_strike, upper_strike),
+            "reversion_zone_gld": reversion_zone,
             "reversion_zone_xau": (xau_zone_low, xau_zone_high),
             "spot_gld": spot,
             "spot_xau": xau_spot,
-            "spot_date": spot_date,
-            "spot_source": spot_source,
             "deviation_pct": deviation_pct,
             "deviation_comment": deviation_comment,
-            "reversion_comment": reversion_comment,
+            "reversion_comment": (
+                f"当前使用近月、近价期权计算的反转带，"
+                f"区间约 GLD {lower_strike:.1f}–{upper_strike:.1f}，"
+                "仅作为结构中枢参考。"
+            ),
             "skew_comment": skew_comment,
         }
 
     except Exception as e:
         return {
-            "underlying": "GLD 期权",
+            "underlying": "GLD 近月期权",
             "expiry": "数据获取失败",
             "max_pain_gld": None,
             "max_pain_xau": None,
@@ -322,12 +292,10 @@ def get_maxpain_skew_summary():
             "reversion_zone_xau": None,
             "spot_gld": None,
             "spot_xau": None,
-            "spot_date": None,
-            "spot_source": None,
             "deviation_pct": None,
-            "deviation_comment": f"期权数据获取失败，暂不使用 MaxPain 偏离（{type(e).__name__}）。",
-            "reversion_comment": "期权数据获取失败，暂不评估反转带位置。",
-            "skew_comment": f"期权数据获取失败，暂不评估 Skew（{type(e).__name__}）。",
+            "deviation_comment": f"近月期权数据获取失败，暂不使用 MaxPain 偏离（{type(e).__name__}）。",
+            "reversion_comment": "近月期权数据获取失败，暂不评估反转带位置。",
+            "skew_comment": f"近月 Skew 数据获取失败，暂不评估 Skew（{type(e).__name__}）。",
         }
 
 
@@ -337,56 +305,28 @@ def get_vol_proxy():
     用 GLD 过去 20 个交易日的历史波动率，做一个“简化版波动率指标”：
     - hv_20: 20 日年化波动率（%）
     - level: 低波动 / 中等波动 / 高波动
-    优先使用 Polygon，失败则降级为 yfinance。
     """
-    # 优先 Polygon
     try:
-        bars = fetch_gld_history_from_polygon(days=60)
-        closes = [b["close"] for b in bars]
-        if len(closes) < 22:
+        ticker = yf.Ticker("GLD")
+        hist = ticker.history(period="60d")
+        if hist.empty or len(hist) < 22:
             raise ValueError("历史数据不足")
 
-        rets = []
-        for i in range(1, len(closes)):
-            if closes[i - 1] <= 0:
-                continue
-            r = closes[i] / closes[i - 1]
-            rets.append(math.log(r))
-        rets = rets[-20:]
-        if len(rets) < 10:
-            raise ValueError("有效收益样本不足")
+        hist["ret"] = (hist["Close"] / hist["Close"].shift(1)).apply(
+            lambda x: math.log(x)
+        )
+        rets = hist["ret"].dropna().tail(20)
+        if rets.empty:
+            raise ValueError("无法计算波动率")
 
-        mean_ret = sum(rets) / len(rets)
-        var = sum((x - mean_ret) ** 2 for x in rets) / (len(rets) - 1)
-        std = math.sqrt(var)
-        hv_20 = float(std * math.sqrt(252) * 100)
+        hv_20 = float(rets.std() * math.sqrt(252) * 100)
 
-        source = "Polygon"
-
-    except Exception:
-        # 降级 yfinance
-        try:
-            ticker = yf.Ticker("GLD")
-            hist = ticker.history(period="60d")
-            if hist.empty or len(hist) < 22:
-                raise ValueError("历史数据不足")
-
-            hist["ret"] = (hist["Close"] / hist["Close"].shift(1)).apply(
-                lambda x: math.log(x)
-            )
-            rets = hist["ret"].dropna().tail(20)
-            if rets.empty:
-                raise ValueError("无法计算波动率")
-
-            hv_20 = float(rets.std() * math.sqrt(252) * 100)
-            source = "yfinance"
-
-        except Exception as e:
-            return {
-                "hv_20": None,
-                "level": "数据获取失败",
-                "comment": f"波动率数据获取失败（{type(e).__name__}），暂不根据 HV 调整仓位。",
-            }
+    except Exception as e:
+        return {
+            "hv_20": None,
+            "level": "数据获取失败",
+            "comment": f"波动率数据获取失败（{type(e).__name__}），暂不根据 HV 调整仓位。",
+        }
 
     if hv_20 < 15:
         level = "低波动"
@@ -406,8 +346,6 @@ def get_vol_proxy():
             f"20 日年化波动率约 {hv_20:.1f}%，处于高波动阶段，"
             "假突破和剧烈拉扯都更频繁，仓位和止损需要更保守。"
         )
-
-    comment += f"（数据源: {source}）"
 
     return {
         "hv_20": hv_20,
@@ -443,8 +381,12 @@ def get_lbma_fixing_summary():
     - 给出方向文字结论
     """
     try:
-        am_date, am_usd = _fetch_latest_lbma_fix("https://prices.lbma.org.uk/json/gold_am.json")
-        pm_date, pm_usd = _fetch_latest_lbma_fix("https://prices.lbma.org.uk/json/gold_pm.json")
+        am_date, am_usd = _fetch_latest_lbma_fix(
+            "https://prices.lbma.org.uk/json/gold_am.json"
+        )
+        pm_date, pm_usd = _fetch_latest_lbma_fix(
+            "https://prices.lbma.org.uk/json/gold_pm.json"
+        )
     except Exception as e:
         return {
             "am_fix": f"获取失败（{e}）",
@@ -561,13 +503,6 @@ def calc_structure_score(cme, mp, vol, lbma):
 def build_auto_strategy_lines(cme, mp, vol, lbma, rating):
     """
     把结构信号翻译成接近“今日交易计划”的语句
-    输出一段【自动策略建议】文本，格式类似：
-      ⭐ 今日结构: 偏多
-      🎯 做单方向: 主多
-      🟢 多单区: xxxx
-      🔴 空单区: xxxx
-      ⛔ 禁止追空: MaxPain 偏离低风险
-      💡 提示: 波动率中等，CPR 较窄 → 易震荡/洗盘
     """
     lines = []
 
@@ -737,17 +672,11 @@ def build_micro_report():
         lines.append(
             f"• 反转带(GLD): {low_gld:.1f} - {high_gld:.1f}  ≈ XAU {low_xau:.0f} - {high_xau:.0f} 美元"
         )
-        lines.append(f"• 当前 GLD 价格: {spot_gld:.2f}")
+        lines.append(f"• 当前 GLD 收盘价: {spot_gld:.2f}")
         lines.append(
             f"  → 换算为黄金现货价格 ≈ {spot_xau:.0f} 美元（仅用于区间参考）"
         )
-        lines.append(
-            "  （提示：GLD 为美股收盘价，周一 22:30 开盘后会跳空对齐黄金 XAUUSD）"
-        )
-        if mp.get("spot_date"):
-            lines.append(
-                f"• GLD 数据日期: {mp['spot_date']}（来源: {mp.get('spot_source', '未知')}）"
-            )
+        lines.append("  ⚠ 注意：此处为结构价，不是 XAUUSD 实盘价格。")
         lines.append(f"• 偏离风险: {mp['deviation_comment']}")
         lines.append(f"• 反转带评估: {mp['reversion_comment']}")
         lines.append(f"• Skew评估: {mp['skew_comment']}")
@@ -758,7 +687,7 @@ def build_micro_report():
     if mp.get("max_pain_xau") is not None and mp.get("reversion_zone_xau") is not None:
         low_xau, high_xau = mp["reversion_zone_xau"]
         lines.append(
-            f"• MaxPain 中枢: XAU {mp['max_pain_xau']:.0f} 美元（来自 GLD 期权结构）"
+            f"• MaxPain 中枢: XAU {mp['max_pain_xau']:.0f} 美元（来自 GLD 近月期权结构）"
         )
         lines.append(
             f"• 反转带区间: XAU {low_xau:.0f} - {high_xau:.0f} 美元（资金均衡带）"
@@ -781,6 +710,7 @@ def build_micro_report():
 
     # ==== LBMA ====
     lines.append("【LBMA 定盘价】")
+    lbma = get_lbma_fixing_summary()
     lines.append(f"• AM Fix: {lbma['am_fix']}")
     lines.append(f"• PM Fix: {lbma['pm_fix']}")
     lines.append(f"• 评估: {lbma['bias_comment']}")
@@ -801,7 +731,7 @@ def build_micro_report():
     lines.append(f"• 波动环境: {vol['level']} → {vol['comment']}")
     if mp.get("max_pain_gld") is not None and mp.get("deviation_pct") is not None:
         lines.append(
-            f"• MaxPain 偏离: 当前 GLD 相对 MaxPain 偏离约 {mp['deviation_pct']:.2f}% → {mp['deviation_comment']}"
+            f"• MaxPain 偏离: 当前 GLD 相对近月 MaxPain 偏离约 {mp['deviation_pct']:.2f}% → {mp['deviation_comment']}"
         )
     lines.append(
         "• CME/CFTC: 若 CME 接口持续超时，则仅把 CFTC 周度持仓作为背景参考，不单独依赖持仓博方向。"
