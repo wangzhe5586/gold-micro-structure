@@ -8,26 +8,26 @@ import yfinance as yf
 # ========= LBMA 定盘价 =========
 def get_lbma_fix(session="AM"):
     """
-    简化版 LBMA 定盘价获取函数
-    来源：metals-api（镜像），无需密钥
+    获取 LBMA 定盘价：AM 和 PM
+    来源：LBMA 官方 JSON 数据接口
     session: "AM" 或 "PM"
     返回 float 或 None
     """
-    url = "https://metals-api-nexteon-bridge.vercel.app/api/fix/gold"
-
+    url = "https://prices.lbma.org.uk/json/gold_am.json" if session == "AM" else "https://prices.lbma.org.uk/json/gold_pm.json"
+    
     try:
-        r = requests.get(url, timeout=10).json()
-        if "data" not in r:
-            return None
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()  # 处理 HTTP 错误
 
-        fix = r["data"]
-        if session == "AM":
-            return float(fix.get("am", None))
-        elif session == "PM":
-            return float(fix.get("pm", None))
-        return None
-    except:
-        return None
+        data = r.json()
+        if "v" not in data or not data["v"]:
+            return None  # 如果没有有效数据，返回 None
+
+        # 获取定盘价
+        return float(data["v"][0])  # 返回美元价格
+
+    except Exception as e:
+        return None  # 异常时返回 None
 
 
 # ========= 配置 =========
