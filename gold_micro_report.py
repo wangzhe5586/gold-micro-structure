@@ -22,6 +22,8 @@ def get_lbma_fix(session="AM"):
             r.raise_for_status()  # 处理 HTTP 错误
 
             data = r.json()
+
+            # 检查返回的数据是否包含 "v" 字段
             if "v" not in data or not data["v"]:
                 print(f"获取数据失败: 没有 'v' 字段 或 空数据。")
                 return None  # 如果没有有效数据，返回 None
