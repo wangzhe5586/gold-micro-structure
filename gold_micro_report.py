@@ -32,8 +32,8 @@ def get_lbma_fix(session="AM"):
 
 # ========= 配置 =========
 # 这里请换成你自己仓库里的 BOT_TOKEN / CHAT_ID
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+BOT_TOKEN = "8053639726:AAE_Kjpin_UGi6rrHDeDRvT9WrYVKUtR3UY"
+CHAT_ID = "6193487818"
 
 CN_TZ = timezone(timedelta(hours=8))
 
