@@ -181,6 +181,38 @@ def calc_short_term_maxpain():
         "skew": skew,
         "dev": (spot - best_strike) / best_strike * 100,
     }
+    # ==== LBMA 定盘价（精简版） ====
+lbma_am = get_lbma_fix("AM")
+lbma_pm = get_lbma_fix("PM")
+
+lines.append("【LBMA 定盘价（精简）】")
+lines.append(f"• AM Fix: {lbma_am} USD")
+lines.append(f"• PM Fix: {lbma_pm} USD")
+
+# 一句话判断
+if lbma_pm > lbma_am:
+    lbma_comment = "PM > AM → 偏多（多头主导）"
+else:
+    lbma_comment = "PM < AM → 偏空（空头主导）"
+
+lines.append(f"• 结论: {lbma_comment}")
+lines.append("")
+# ==== 波动率 Proxy（精简版） ====
+hv20 = get_hist_volatility("GLD", window=20)
+
+lines.append("【波动率 Proxy（精简）】")
+lines.append(f"• 20 日年化波动率: {hv20:.2f}%")
+
+if hv20 >= 22:
+    hv_comment = "高波动 → 容易出现突破单（日内波动大）"
+elif hv20 >= 17:
+    hv_comment = "中等波动 → 趋势/震荡并存，需要结合 CPR/OB 判断"
+else:
+    hv_comment = "低波动 → 偏震荡，突破概率低"
+
+lines.append(f"• 结论: {hv_comment}")
+lines.append("")
+
 # ========= 生成报告 ==========
 def build_report():
 
