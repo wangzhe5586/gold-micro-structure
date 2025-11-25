@@ -4,6 +4,32 @@ from datetime import datetime, timedelta, timezone
 import math
 import yfinance as yf
 
+def get_lbma_fix(session="AM"):
+    """
+    简化版 LBMA 定盘价获取函数
+    来源：metals-api（镜像），无需密钥
+    session: "AM" 或 "PM"
+    返回 float 或 None
+    """
+    url = "https://metals-api-nexteon-bridge.vercel.app/api/fix/gold"
+
+    try:
+        r = requests.get(url, timeout=10).json()
+
+        if "data" not in r:
+            return None
+
+        fix = r["data"]
+        if session == "AM":
+            return float(fix.get("am", None))
+        elif session == "PM":
+            return float(fix.get("pm", None))
+
+        return None
+
+    except:
+        return None
+
 # ========= 配置 =========
 BOT_TOKEN = "8053639726:AAE_Kjpin_UGi6rrHDeDRvT9WrYVKUtR3UY"
 CHAT_ID = "6193487818"
