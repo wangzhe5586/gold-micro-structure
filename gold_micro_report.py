@@ -16,8 +16,23 @@ GLD_TO_XAU_FACTOR = 10.75  # 仅用于区间参考，不作为精确报价
 
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, data={"chat_id": CHAT_ID, "text": text})
-    resp.raise_for_status()
+    try:
+        resp = requests.post(url, data={"chat_id": CHAT_ID, "text": text})
+        # 如果 HTTP 层面有错误，直接抛异常让 Actions 任务变红
+        resp.raise_for_status()
+
+        data = resp.json()
+        if not data.get("ok", False):
+            # Telegram API 返回失败，也当作错误抛出去
+            print("Telegram API 返回错误：", data)
+            raise RuntimeError(f"Telegram send error: {data}")
+        else:
+            print("Telegram 发送成功。")
+
+    except Exception as e:
+        # 在日志里清楚看到错误原因
+        print("发送 Telegram 失败：", e)
+        raise
 
 # ========== CME 成交量 / 持仓量（带重试 + 优雅降级） ==========
 
