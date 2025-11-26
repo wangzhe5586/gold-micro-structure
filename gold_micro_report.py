@@ -52,13 +52,15 @@ def fetch_cme_oi():
         except Exception as e:
             if _ < 2:
                 time.sleep(3)
+            # 确保这里捕获异常并打印
+            print("CME 数据获取失败，错误信息：", e)
 
     return {
         "volume": "—",
         "oi": "—",
         "change_oi": "0",
         "ok": False,
-        "error": str(e) if e else "Unknown error",
+        "error": "请求超时或发生错误",
     }
 
 # ========= GLD → XAU 换算 =========
