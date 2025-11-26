@@ -228,10 +228,27 @@ def calc_short_term_maxpain():
     low = strikes[max(0, idx - 1)]
     high = strikes[min(len(strikes) - 1, idx + 1)]
 
-    # Skew：总 Put OI / 总 Call OI
-    call_oi_t = calls["openInterest"].sum()
-    put_oi_t = puts["openInterest"].sum()
-    skew = put_oi_t / call_oi_t if call_oi_t > 0 else None
+    # 增强版 Skew 计算：同时考虑 OI 和 Volume（借鉴昨天版本）
+    call_oi_total = calls["openInterest"].sum()
+    put_oi_total = puts["openInterest"].sum()
+    call_vol_total = calls["volume"].sum()
+    put_vol_total = puts["volume"].sum()
+
+    oi_ratio = put_oi_total / call_oi_total if call_oi_total > 0 else None
+    vol_ratio = put_vol_total / call_vol_total if call_vol_total > 0 else None
+    
+    # 综合 Skew 评分
+    if oi_ratio is not None and vol_ratio is not None:
+        skew_score = (oi_ratio + vol_ratio) / 2.0
+        if skew_score > 1.2:
+            skew_comment = f"偏空（Put/Call OI≈{oi_ratio:.2f}，Vol≈{vol_ratio:.2f}）"
+        elif skew_score < 0.8:
+            skew_comment = f"偏多（Put/Call OI≈{oi_ratio:.2f}，Vol≈{vol_ratio:.2f}）"
+        else:
+            skew_comment = f"中性（Put/Call OI≈{oi_ratio:.2f}，Vol≈{vol_ratio:.2f}）"
+    else:
+        skew_comment = "数据不足"
+        skew_score = None
 
     return {
         "ok": True,
@@ -241,7 +258,8 @@ def calc_short_term_maxpain():
         "mp_xau": best_strike * GLD_TO_XAU,
         "rev": (float(low), float(high)),
         "rev_xau": (low * GLD_TO_XAU, high * GLD_TO_XAU),
-        "skew": skew,
+        "skew": skew_score,
+        "skew_comment": skew_comment,
         "dev": (spot - best_strike) / best_strike * 100,
     }
 
@@ -304,13 +322,8 @@ def build_report():
             + ("偏离大，短期易补价" if abs(op["dev"]) >= 0.8 else "贴近中枢，短期偏震荡")
         )
 
-        if op["skew"] is not None:
-            if op["skew"] > 1.2:
-                lines.append(f"• Skew：{op['skew']:.2f}（偏空）")
-            elif op["skew"] < 0.8:
-                lines.append(f"• Skew：{op['skew']:.2f}（偏多）")
-            else:
-                lines.append(f"• Skew：{op['skew']:.2f}（中性）")
+if op.get("skew_comment"):
+    lines.append(f"• Skew：{op['skew_comment']}")
         lines.append("")
 
     # ==== LBMA 定盘价（精简）====
